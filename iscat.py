@@ -1,3 +1,4 @@
+# File: iscat_simulation.py
 #run conda activate sim_env
 
 import numpy as np
@@ -19,7 +20,7 @@ PARAMS = {
     "image_size_pixels": 1024,       # Size of the output image in pixels (e.g., 512x512)
     "pixel_size_nm": 600,            # Physical size of one pixel in nanometers
     "fps": 30,                      # Frames per second of the output video
-    "duration_seconds": 5,          # Total duration of the simulation video
+    "duration_seconds": 1,          # Total duration of the simulation video
     "output_filename": os.path.join(os.path.expanduser('~'), 'Desktop', 'iscat_simulation.mp4'),
 
     # --- MASK GENERATION ---
@@ -52,12 +53,13 @@ PARAMS = {
     # --- iPSF & SCATTERING CALCULATION ---
     "psf_oversampling_factor": 2,   # Calculate PSF at higher resolution for accuracy. 1 = no oversampling.
     "pupil_samples": 512,           # Resolution of pupil function grid. Higher is more accurate.
-    "z_stack_range_nm": 20000,       # Axial range for pre-computing the iPSF stack (e.g., +/- 10 um)
+    "z_stack_range_nm": 30000,       # Axial range for pre-computing the iPSF stack (e.g., +/- 10 um)
     "z_stack_step_nm": 50,         # Axial step size for the iPSF stack
 
     # --- ABERRATIONS & PUPIL FUNCTION ---
     "spherical_aberration_strength": 0.25,
-    "apodization_factor": 1.8,      # Reduces the "ripple" effect by suppressing outer rings more.
+    "apodization_factor": 1.8,
+    "random_aberration_strength": 1.5,
 
     # --- INTERFERENCE & NOISE MODEL ---
     "reference_field_amplitude": 1, # Amplitude of the reference field E_R
@@ -257,6 +259,11 @@ def compute_ipsf_stack(params, particle_diameter_nm, particle_refractive_index):
     for i, z in enumerate(tqdm(z_values)):
         defocus_phase = k_medium * z * cos_theta
         aberration_phase = defocus_phase + spherical_phase
+        
+        # This simulates the complex, random aberrations of a real lens system.
+        # It now uses the new parameter from the top of the file.
+        aberration_phase += (np.random.rand(pupil_samples, pupil_samples) - 0.5) * params["random_aberration_strength"] * 2 * np.pi
+
         pupil_function = (-1j * wavelength_medium_nm) * aperture_mask * apodization * S2_vec * np.exp(1j * aberration_phase)
         
         # The Amplitude Spread Function (ASF) is the Fourier transform of the pupil function.
