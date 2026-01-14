@@ -63,7 +63,7 @@ PARAMS = {
     "shot_noise_enabled": True,        # Poisson noise
     "shot_noise_scaling_factor": 1.00, # Custom knob to control shot noise strength (0=off, 1=full)
     "gaussian_noise_enabled": True,    # Read noise
-    "read_noise_std": 18,              # Std dev of Gaussian readout noise (in camera counts)
+    "read_noise_std": 17,              # Std dev of Gaussian readout noise (in camera counts)
     # Method for converting raw signal/reference into contrast frames in post-processing:
     #   'reference_frame' -> (Signal - Reference) / Reference
     #   'video_mean'      -> Signal - mean(Signal over time)
