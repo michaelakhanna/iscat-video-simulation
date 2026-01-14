@@ -3,6 +3,9 @@ import cv2
 from tqdm import tqdm
 import os
 
+from mask_generation import generate_and_save_mask_for_particle
+
+
 def add_noise(frame, params):
     """
     Applies simulated shot (Poisson) and read (Gaussian) noise to an image frame.
@@ -24,8 +27,9 @@ def add_noise(frame, params):
 
     if params["gaussian_noise_enabled"]:
         noisy_frame += np.random.normal(scale=params["read_noise_std"], size=frame.shape)
-    
+
     return noisy_frame
+
 
 def generate_video_and_masks(params, trajectories, ipsf_interpolators):
     """
@@ -52,7 +56,7 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
 
     E_ref = params["reference_field_amplitude"]
     background = params["background_intensity"]
-    
+
     num_subsamples = params["motion_blur_subsamples"] if params["motion_blur_enabled"] else 1
     sub_dt = dt / num_subsamples
 
@@ -85,7 +89,7 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
 
                 # Get the pre-computed scattered field (iPSF) for the particle's z-position.
                 E_sca_2D = ipsf_interpolators[i]([pz])[0]
-                
+
                 # Upscale to the oversampled resolution for higher accuracy placement.
                 resized_real = cv2.resize(
                     np.real(E_sca_2D),
@@ -117,7 +121,7 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
                     shift=(shift_y, shift_x),
                     axis=(0, 1)
                 )
-                
+
                 # Apply signal multiplier and accumulate for motion blur.
                 blurred_particle_fields[i] += (
                     E_sca_particle_inst * params["particle_signal_multipliers"][i]
@@ -131,31 +135,24 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
         if params["mask_generation_enabled"]:
             for i in range(params["num_particles"]):
                 E_sca_particle_blurred = blurred_particle_fields[i]
-                
-                # Contrast is the change in intensity caused by the particle's scattered field.
-                contrast_os = np.abs(E_ref + E_sca_particle_blurred)**2 - np.abs(E_ref)**2
-                contrast_final = cv2.resize(contrast_os, final_size, interpolation=cv2.INTER_AREA)
-                
-                # Create a binary mask by thresholding the particle's own signal strength.
-                max_val = np.max(np.abs(contrast_final))
-                if max_val > 1e-9:  # Avoid division by zero for invisible particles.
-                    normalized_contrast = np.abs(contrast_final) / max_val
-                    mask = (normalized_contrast > params["mask_threshold"]).astype(np.uint8) * 255
-                else:  # If particle has no signal, generate an empty mask.
-                    mask = np.zeros(final_size, dtype=np.uint8)
 
-                mask_path = os.path.join(
-                    params["mask_output_directory"],
-                    f"particle_{i+1}",
-                    f"frame_{f:04d}.png"
+                # Contrast is the change in intensity caused by the particle's scattered field.
+                contrast_os = np.abs(E_ref + E_sca_particle_blurred) ** 2 - np.abs(E_ref) ** 2
+                contrast_final = cv2.resize(contrast_os, final_size, interpolation=cv2.INTER_AREA)
+
+                # Delegate mask creation and saving to the mask_generation subsystem.
+                generate_and_save_mask_for_particle(
+                    contrast_image=contrast_final,
+                    params=params,
+                    particle_index=i,
+                    frame_index=f,
                 )
-                cv2.imwrite(mask_path, mask)
 
         # --- Final Video Frame Generation ---
         E_sca_total = np.sum(blurred_particle_fields, axis=0)
-        
+
         # Interfere the total scattered field with the reference field to get intensity.
-        intensity_os = np.abs(E_ref + E_sca_total)**2
+        intensity_os = np.abs(E_ref + E_sca_total) ** 2
         intensity = cv2.resize(intensity_os, final_size, interpolation=cv2.INTER_AREA)
 
         # Scale intensity to camera counts.

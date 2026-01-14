@@ -54,7 +54,7 @@ PARAMS = {
     "shot_noise_enabled": True,      # poisson noise
     "shot_noise_scaling_factor": 1.00, # Custom knob to control shot noise strength (0=off, 1=full)
     "gaussian_noise_enabled": True,  # read noise
-    "read_noise_std": 15,            # Standard deviation of Gaussian readout noise (in camera counts)
+    "read_noise_std": 18,            # Standard deviation of Gaussian readout noise (in camera counts)
 
     # --- MOTION BLUR ---
     "motion_blur_enabled": True,     # Enable/disable motion blur simulation
