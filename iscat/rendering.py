@@ -1,9 +1,9 @@
 import numpy as np
 import cv2
 from tqdm import tqdm
-import os
 
 from mask_generation import generate_and_save_mask_for_particle
+from trackability import TrackabilityModel
 
 
 def add_noise(frame, params):
@@ -38,16 +38,20 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
 
     Args:
         params (dict): The main simulation parameter dictionary.
-        trajectories (numpy.ndarray): The 3D array of particle trajectories.
-        ipsf_interpolators (list): A list of iPSF interpolator objects, one for each particle.
+        trajectories (numpy.ndarray): The 3D array of particle trajectories with
+            shape (num_particles, num_frames, 3) in nanometers.
+        ipsf_interpolators (list): A list of iPSF interpolator objects, one for
+            each particle.
 
     Returns:
         tuple[list, list]: A tuple containing two lists: one for the raw signal
-                           frames and one for the raw reference frames, both as
-                           16-bit integer arrays.
+            frames and one for the raw reference frames, both as 16-bit integer
+            arrays.
     """
     num_frames = int(params["fps"] * params["duration_seconds"])
-    dt = 1 / params["fps"]
+    dt = 1.0 / params["fps"]
+    num_particles = params["num_particles"]
+
     img_size = params["image_size_pixels"]
     pixel_size_nm = params["pixel_size_nm"]
     os_factor = params["psf_oversampling_factor"]
@@ -80,12 +84,24 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
     all_signal_frames = []
     all_reference_frames = []
 
+    # Initialize the human trackability confidence model if masks are enabled.
+    if params["mask_generation_enabled"]:
+        trackability_model = TrackabilityModel(params, num_particles)
+        trackability_threshold = params.get("trackability_confidence_threshold", 0.8)
+        if not (0.0 <= trackability_threshold <= 1.0):
+            raise ValueError(
+                "PARAMS['trackability_confidence_threshold'] must be between 0 and 1."
+            )
+    else:
+        trackability_model = None
+        trackability_threshold = None
+
     print("Generating video frames and masks...")
     for f in tqdm(range(num_frames)):
         # Accumulators for the motion-blurred electric field of each particle.
         blurred_particle_fields = [
             np.zeros((os_size, os_size), dtype=np.complex128)
-            for _ in range(params["num_particles"])
+            for _ in range(num_particles)
         ]
 
         # --- Subsample rendering for motion blur ---
@@ -97,11 +113,11 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
 
             # Linearly interpolate particle positions between trajectory points.
             current_pos_nm = (
-                (1 - interp_factor) * trajectories[:, frame_idx_floor, :] +
-                interp_factor * trajectories[:, frame_idx_ceil, :]
+                (1.0 - interp_factor) * trajectories[:, frame_idx_floor, :]
+                + interp_factor * trajectories[:, frame_idx_ceil, :]
             )
 
-            for i in range(params["num_particles"]):
+            for i in range(num_particles):
                 px, py, pz = current_pos_nm[i]
 
                 # Get the pre-computed scattered field (iPSF) for the particle's z-position.
@@ -111,12 +127,12 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
                 resized_real = cv2.resize(
                     np.real(E_sca_2D),
                     (os_size, os_size),
-                    interpolation=cv2.INTER_LINEAR
+                    interpolation=cv2.INTER_LINEAR,
                 )
                 resized_imag = cv2.resize(
                     np.imag(E_sca_2D),
                     (os_size, os_size),
-                    interpolation=cv2.INTER_LINEAR
+                    interpolation=cv2.INTER_LINEAR,
                 )
                 E_sca_2D_rescaled = resized_real + 1j * resized_imag
 
@@ -136,7 +152,7 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
                 E_sca_particle_inst = np.roll(
                     E_sca_2D_rescaled,
                     shift=(shift_y, shift_x),
-                    axis=(0, 1)
+                    axis=(0, 1),
                 )
 
                 # Apply signal multiplier and accumulate for motion blur.
@@ -145,25 +161,45 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
                 )
 
         # Average the fields from all subsamples to create the final motion-blurred field.
-        for i in range(params["num_particles"]):
+        for i in range(num_particles):
             blurred_particle_fields[i] /= num_subsamples
 
         # --- Mask Generation for this Frame ---
         if params["mask_generation_enabled"]:
-            for i in range(params["num_particles"]):
+            for i in range(num_particles):
+                # Skip particles that have already been declared "lost".
+                if trackability_model.is_particle_lost(i):
+                    continue
+
                 E_sca_particle_blurred = blurred_particle_fields[i]
 
                 # Contrast is the change in intensity caused by the particle's scattered field.
                 contrast_os = np.abs(E_ref + E_sca_particle_blurred) ** 2 - np.abs(E_ref) ** 2
-                contrast_final = cv2.resize(contrast_os, final_size, interpolation=cv2.INTER_AREA)
+                contrast_final = cv2.resize(
+                    contrast_os, final_size, interpolation=cv2.INTER_AREA
+                )
 
-                # Delegate mask creation and saving to the mask_generation subsystem.
-                generate_and_save_mask_for_particle(
-                    contrast_image=contrast_final,
-                    params=params,
+                # Compute the human trackability confidence for this particle in this frame.
+                position_nm = trajectories[i, f, :]  # [x, y, z] at the frame time
+                confidence = trackability_model.update_and_compute_confidence(
                     particle_index=i,
                     frame_index=f,
+                    position_nm=position_nm,
+                    contrast_image=contrast_final,
                 )
+
+                if confidence >= trackability_threshold:
+                    # Delegate mask creation and saving to the mask_generation subsystem.
+                    generate_and_save_mask_for_particle(
+                        contrast_image=contrast_final,
+                        params=params,
+                        particle_index=i,
+                        frame_index=f,
+                    )
+                else:
+                    # Once a particle is considered lost, its mask is no longer generated
+                    # for the remainder of the video.
+                    trackability_model.lost[i] = True
 
         # --- Final Video Frame Generation ---
         E_sca_total = np.sum(blurred_particle_fields, axis=0)
@@ -189,6 +225,16 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
         all_reference_frames.append(
             np.clip(reference_frame_noisy, 0, max_camera_count).astype(np.uint16)
         )
+
+        # If all particles are lost according to the trackability model, we can
+        # terminate video generation early. The existing frames (up to and
+        # including this one) remain valid and are passed on to post-processing.
+        if params["mask_generation_enabled"] and trackability_model.are_all_particles_lost():
+            print(
+                f"All particles lost according to the trackability model at frame {f}. "
+                "Terminating video generation early."
+            )
+            break
 
     print("Frame and mask generation complete.")
     return all_signal_frames, all_reference_frames
