@@ -54,6 +54,23 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
     final_size = (img_size, img_size)
     os_size = img_size * os_factor
 
+    # --- Bit depth and camera count handling ---
+    # The raw simulated frames are stored as uint16 but their meaningful dynamic
+    # range is controlled by PARAMS["bit_depth"]. This allows us to simulate
+    # 12-bit, 14-bit, or 16-bit cameras while keeping the storage format simple.
+    bit_depth = params["bit_depth"]
+    if not isinstance(bit_depth, int) or bit_depth <= 0:
+        raise ValueError("PARAMS['bit_depth'] must be a positive integer.")
+
+    max_supported_bit_depth = 16  # Limited by uint16 storage in this implementation.
+    if bit_depth > max_supported_bit_depth:
+        raise ValueError(
+            f"PARAMS['bit_depth']={bit_depth} exceeds the maximum supported bit depth "
+            f"of {max_supported_bit_depth} for uint16 storage."
+        )
+
+    max_camera_count = (1 << bit_depth) - 1
+
     E_ref = params["reference_field_amplitude"]
     background = params["background_intensity"]
 
@@ -162,12 +179,16 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
             intensity_scaled = background * np.ones_like(intensity)
 
         signal_frame_noisy = add_noise(intensity_scaled, params)
-        all_signal_frames.append(np.clip(signal_frame_noisy, 0, 65535).astype(np.uint16))
+        all_signal_frames.append(
+            np.clip(signal_frame_noisy, 0, max_camera_count).astype(np.uint16)
+        )
 
         # Generate a corresponding noisy reference frame for background subtraction.
         reference_frame_ideal = np.full(final_size, background, dtype=float)
         reference_frame_noisy = add_noise(reference_frame_ideal, params)
-        all_reference_frames.append(np.clip(reference_frame_noisy, 0, 65535).astype(np.uint16))
+        all_reference_frames.append(
+            np.clip(reference_frame_noisy, 0, max_camera_count).astype(np.uint16)
+        )
 
     print("Frame and mask generation complete.")
     return all_signal_frames, all_reference_frames
