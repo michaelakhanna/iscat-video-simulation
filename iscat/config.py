@@ -82,6 +82,46 @@ PARAMS = {
     # --- MOTION BLUR ---
     "motion_blur_enabled": True,       # Enable/disable motion blur simulation
     "motion_blur_subsamples": 4,       # Number of sub-steps per frame for motion blur. 1 = no blur.
+
+    # --- CHIP PATTERN & SUBSTRATE ---
+    # Centralized configuration for non-homogeneous, stationary chip patterns
+    # (e.g., gold film with circular holes) that modify the reference field and
+    # background intensity maps. When disabled or when the preset is
+    # "empty_background", the behavior is identical to a uniform background.
+    "chip_pattern_enabled": True,          # Master switch for chip pattern simulation
+    # Model that defines the geometry / structure of the pattern.
+    # Supported now: "gold_holes_v1" (gold film with circular holes on a square grid).
+    # Use "none" to force a uniform background even if chip_pattern_enabled is True.
+    "chip_pattern_model": "gold_holes_v1",
+    # Contrast evolution model for the chip pattern. "static" means time-invariant
+    # contrast; time-dependent models can be added later.
+    "chip_pattern_contrast_model": "static",
+    # Substrate/background preset:
+    #   "empty_background"       -> no chip pattern (uniform background)
+    #   "default_gold_holes"     -> gold film with circular holes using the
+    #                               user-provided dimensions below
+    #   "lab_default_gold_holes" -> gold film with circular holes using the
+    #                               canonical lab defaults (15 µm holes, 2 µm spacing,
+    #                               20 nm total metal thickness)
+    "chip_substrate_preset": "default_gold_holes",
+    # Geometry and optical-intensity parameters for the chip pattern. For the
+    # "gold_holes_v1" model these are:
+    #   - hole_diameter_um: diameter of circular holes in micrometers
+    #   - hole_edge_to_edge_spacing_um: gold spacing between hole edges (µm)
+    #   - hole_depth_nm: depth / total metal thickness in nanometers (currently
+    #                    a bookkeeping parameter for future optical refinements)
+    #   - hole_intensity_factor: relative background intensity inside holes
+    #   - gold_intensity_factor: relative background intensity in gold regions
+    #
+    # The pattern map is normalized to unit mean, so the overall brightness
+    # remains controlled by "background_intensity".
+    "chip_pattern_dimensions": {
+        "hole_diameter_um": 15.0,
+        "hole_edge_to_edge_spacing_um": 2.0,
+        "hole_depth_nm": 20.0,           # 5 nm Cr + 15 nm Au is a typical total
+        "hole_intensity_factor": 0.7,    # Holes slightly darker than gold (reflection geometry)
+        "gold_intensity_factor": 1.0,    # Reference intensity level in gold regions
+    },
 }
 
 # --- PHYSICAL CONSTANTS ---

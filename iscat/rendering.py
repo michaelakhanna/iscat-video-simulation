@@ -377,11 +377,18 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
         intensity = cv2.resize(intensity_os, final_size, interpolation=cv2.INTER_AREA)
 
         # Scale intensity to camera counts using the per-pixel background map.
+        # For a spatially varying reference field, the physically consistent
+        # mapping is:
+        #
+        #   intensity_scaled(x, y) = background_final(x, y)
+        #                            * intensity(x, y) / E_ref_intensity_final(x, y)
+        #
+        # This reduces to the original behavior when E_ref_intensity_final = 1,
+        # and guarantees non-negative intensities everywhere.
         if np.max(intensity) > 0:
-            intensity_scaled = (
-                background_final
-                + (intensity - E_ref_intensity_final) * background_final
-            )
+            # Avoid division by zero in any degenerate case.
+            E_ref_intensity_safe = np.maximum(E_ref_intensity_final, 1e-12)
+            intensity_scaled = background_final * (intensity / E_ref_intensity_safe)
         else:
             # Degenerate case: no contrast; fall back to pure background.
             intensity_scaled = background_final.copy()
