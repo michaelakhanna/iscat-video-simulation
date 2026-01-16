@@ -30,6 +30,11 @@ def simulate_trajectories(params):
     constraints (e.g., z-motion constraint models or chip/substrate
     exclusion) without another structural rewrite.
 
+    The current implementation corresponds to the "unconstrained" model of
+    z-axis motion described in the Code Design Document, selected via
+    PARAMS["z_motion_constraint_model"] == "unconstrained". Other models are
+    explicitly rejected until they are fully defined and implemented.
+    
     Args:
         params (dict): Simulation parameter dictionary (PARAMS).
 
@@ -51,6 +56,20 @@ def simulate_trajectories(params):
 
     dt = 1.0 / fps
     num_particles = int(params["num_particles"])
+
+    # --- Z-motion constraint model selection and validation ---
+    z_model_raw = params.get("z_motion_constraint_model", "unconstrained")
+    z_model = str(z_model_raw).strip().lower()
+
+    # For now we implement only the fully free 3D Brownian motion model,
+    # which is the behavior that previously existed. Additional models such as
+    # "surface_interaction_v1" will be added explicitly when their physics are
+    # fully specified.
+    if z_model != "unconstrained":
+        raise ValueError(
+            f"Unsupported z_motion_constraint_model '{z_model_raw}'. "
+            "Currently only 'unconstrained' 3D Brownian motion is implemented."
+        )
 
     # --- Initialize particle positions ---
     # If explicit initial positions are provided, validate and use them.
@@ -111,11 +130,11 @@ def simulate_trajectories(params):
             # Previous position at the last frame.
             prev_position_nm = trajectories[i, frame_idx - 1, :]
 
-            # For now, we simulate unconstrained Brownian motion: the proposed
-            # step is always accepted. This explicit per-step structure is
-            # intentionally chosen so that future z-motion or chip/substrate
-            # constraints can be injected at this point without another
-            # structural rewrite.
+            # For the "unconstrained" model, we simulate free Brownian motion:
+            # the proposed step is always accepted. This explicit per-step
+            # structure is intentionally chosen so that future z-motion or
+            # chip/substrate constraints can be injected at this point
+            # without another structural rewrite.
             new_position_nm = prev_position_nm + step_nm
 
             trajectories[i, frame_idx, :] = new_position_nm

@@ -156,6 +156,19 @@ PARAMS = {
     # Positive float (e.g., 0.00089 for water at 25 °C).
     "viscosity_Pa_s": 0.00089,
 
+    # Model controlling the Z-axis Brownian motion (and, in future, interactions
+    # with surfaces or substrates).
+    #
+    # Supported values:
+    #   "unconstrained"
+    #       -> Fully free 3D Brownian motion. This corresponds exactly to the
+    #          current implementation of simulate_trajectories and preserves
+    #          existing behavior.
+    #
+    # Additional models such as "surface_interaction_v1" may be added later;
+    # for now, any value other than "unconstrained" is treated as invalid.
+    "z_motion_constraint_model": "unconstrained",
+
     # --- iPSF & SCATTERING CALCULATION ---
     # Oversampling factor for the internal PSF/canvas resolution.
     # Positive integer. 1 = no oversampling; 2 = 2× finer grid in x and y;
