@@ -128,10 +128,11 @@ PARAMS = {
     #   - None, in which case the value will be filled via particle_materials
     #     (if provided) by resolve_particle_refractive_indices.
     #
-    # If particle_materials is omitted, every entry here must be non-None.
+    # In this default configuration we rely entirely on material-based lookup
+    # by setting all entries to None.
     "particle_refractive_indices": [
-        0.166 + 3.15j,  # Gold (Au) at ~635 nm
-        0.166 + 3.15j,
+        None,  # Use material-based lookup for this particle
+        None,
     ],
 
     # Optional high-level material labels for each particle.
@@ -141,8 +142,12 @@ PARAMS = {
     # indices using materials.lookup_refractive_index. Entries may be None
     # for particles whose refractive index is specified explicitly above.
     # If both particle_materials and particle_refractive_indices are provided,
-    # explicit indices override material-based values.
-    # "particle_materials": [...],
+    # explicit indices override material-based values. In this default
+    # configuration we rely entirely on material-based lookup.
+    "particle_materials": [
+        "Gold",  # 60 nm gold nanoparticle
+        "Gold",  # 100 nm gold nanoparticle
+    ],
 
     # Per-particle scalar multipliers applied to the scattered field amplitude.
     # List/sequence of length num_particles with non-negative floats:
