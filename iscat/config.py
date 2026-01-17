@@ -159,15 +159,7 @@ PARAMS = {
     # Model controlling the Z-axis Brownian motion (and, in future, interactions
     # with surfaces or substrates).
     #
-    # Supported values:
-    #   "unconstrained"
-    #       -> Fully free 3D Brownian motion. This corresponds exactly to the
-    #          current implementation of simulate_trajectories and preserves
-    #          existing behavior.
-    #
-    # Additional models such as "surface_interaction_v1" may be added later;
-    # for now, any value other than "unconstrained" is treated as invalid.
-    "z_motion_constraint_model": "surface_interaction_v1",
+    "z_motion_constraint_model": "surface_interaction_v2",
 
     # --- iPSF & SCATTERING CALCULATION ---
     # Oversampling factor for the internal PSF/canvas resolution.
