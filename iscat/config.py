@@ -207,7 +207,7 @@ PARAMS = {
     # Smaller values keep more Airy/PSF rings (larger padding and more compute);
     # larger values cut the PSF earlier to save computation but risk more
     # wrap-around if set too high.
-    "psf_intensity_fraction_threshold": 1e-3,
+    "psf_intensity_fraction_threshold": 1e-4,
 
     # --- ABERRATIONS & PUPIL FUNCTION ---
     # Dimensionless strength of spherical aberration applied as a Zernike-like
