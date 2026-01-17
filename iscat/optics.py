@@ -256,18 +256,29 @@ def compute_ipsf_stack(params, particle_diameter_nm, particle_refractive_index):
     spherical_phase = params["spherical_aberration_strength"] * zernike_spherical * 2 * np.pi
     apodization = np.exp(-params["apodization_factor"] * (rho**2))
 
+    # --- Random aberration phase (static across the entire Z-stack) ---
+    # This simulates static random wavefront aberrations of a real lens system.
+    # The random phase depends only on pupil coordinates (Kx, Ky) and is fixed
+    # for the entire iPSF stack for this particle type and optical configuration.
+    random_aberration_strength = float(params.get("random_aberration_strength", 0.0))
+    if random_aberration_strength != 0.0:
+        random_phase = (
+            np.random.rand(pupil_samples, pupil_samples) - 0.5
+        ) * random_aberration_strength * 2 * np.pi
+    else:
+        # Use a scalar zero so that adding it to the phase arrays is cheap and
+        # does not allocate extra memory.
+        random_phase = 0.0
+
     print(f"Computing iPSF stack for {particle_diameter_nm} nm particle...")
     ipsf_stack_complex = np.zeros((len(z_values), pupil_samples, pupil_samples), dtype=np.complex128)
 
     # --- Compute the iPSF for each Z-slice ---
     for i, z in enumerate(tqdm(z_values)):
         defocus_phase = k_medium * z * cos_theta
-        aberration_phase = defocus_phase + spherical_phase
 
-        # This simulates the complex, random aberrations of a real lens system.
-        aberration_phase += (
-            np.random.rand(pupil_samples, pupil_samples) - 0.5
-        ) * params["random_aberration_strength"] * 2 * np.pi
+        # Total phase in the pupil: defocus + spherical aberration + static random aberration.
+        aberration_phase = defocus_phase + spherical_phase + random_phase
 
         pupil_function = (
             -1j * wavelength_medium_nm
