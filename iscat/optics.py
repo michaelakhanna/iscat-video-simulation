@@ -197,11 +197,29 @@ def mie_S1_S2(m, x, mu):
 def compute_ipsf_stack(params, particle_diameter_nm, particle_refractive_index):
     """
     Computes a complex 3D vectorial interferometric Point Spread Function (iPSF)
-    stack using the Debye-Born integral, calculated via FFT for efficiency.
+    stack using the Debye-Born integral, calculated via FFT for efficiency, and
+    then enforces **radial symmetry** of each slice by ring-averaging the complex
+    field with **continuous radial interpolation**.
 
-    For each discrete z position in the stack, a full 2D complex field is
-    computed. The function returns an interpolator that provides the iPSF at
-    arbitrary z positions within (or outside) the precomputed range.
+    Pipeline:
+        1. Build the pupil function on a 2D k-space grid using:
+             - Circular aperture (NA / n_medium).
+             - Mie scattering amplitude S2(mu) across the pupil.
+             - Apodization, spherical aberration, random aberration.
+        2. Compute the 2D complex Amplitude Spread Function (ASF) via inverse FFT.
+        3. For each z-slice:
+             - Compute ASF as in the original implementation.
+             - Compute a 1D complex radial profile E_radial[k] via integer radius
+               bin averaging (same radial physics as before).
+             - For each pixel, evaluate E(r) at its continuous radius r using
+               linear interpolation of E_radial, instead of snapping to the
+               nearest radius bin.
+
+    This preserves the original Debye-Born + FFT + Mie radial behavior and decay
+    while:
+        - Removing fourfold cross/diamond artifacts (radial symmetry enforced).
+        - Avoiding per-pixel "snapping" that can make the PSF look squarish
+          on the discrete grid.
 
     Args:
         params (dict): The main simulation parameter dictionary.
@@ -270,6 +288,15 @@ def compute_ipsf_stack(params, particle_diameter_nm, particle_refractive_index):
         # does not allocate extra memory.
         random_phase = 0.0
 
+    # --- Precompute radius geometry for radial symmetrization ---
+    yy, xx = np.indices((pupil_samples, pupil_samples))
+    center = pupil_samples // 2
+    r_float = np.sqrt((xx - center) ** 2 + (yy - center) ** 2)  # continuous radius in pixels
+    r_index = r_float.astype(np.int64)                           # integer radius bins
+    max_bin = int(r_index.max())
+    r_index_flat = r_index.ravel()
+    r_flat = r_float.ravel()
+
     print(f"Computing iPSF stack for {particle_diameter_nm} nm particle...")
     ipsf_stack_complex = np.zeros((len(z_values), pupil_samples, pupil_samples), dtype=np.complex128)
 
@@ -286,7 +313,46 @@ def compute_ipsf_stack(params, particle_diameter_nm, particle_refractive_index):
 
         # The Amplitude Spread Function (ASF) is the Fourier transform of the pupil function.
         asf = fftshift(ifft2(ifftshift(pupil_function)))
-        ipsf_stack_complex[i, :, :] = asf
+
+        # --- Radially symmetrize the ASF with continuous radial interpolation ---
+        # Step 1: compute 1D complex radial profile via integer radius bin averages.
+        asf_flat = asf.ravel()
+
+        counts = np.bincount(r_index_flat, minlength=max_bin + 1)
+        sum_real = np.bincount(r_index_flat, weights=asf_flat.real, minlength=max_bin + 1)
+        sum_imag = np.bincount(r_index_flat, weights=asf_flat.imag, minlength=max_bin + 1)
+
+        E_radial = np.zeros(max_bin + 1, dtype=np.complex128)
+        nonzero = counts > 0
+        E_radial[nonzero] = (sum_real[nonzero] + 1j * sum_imag[nonzero]) / counts[nonzero]
+
+        # Preserve the exact on-axis amplitude from the original ASF at the
+        # optical center so that the central peak normalization is unchanged.
+        E_radial[0] = asf[center, center]
+
+        # Step 2: build a smooth radial field by interpolating E_radial at the
+        # continuous radius r_float for each pixel instead of snapping to the
+        # nearest integer radius bin.
+        r_bins = np.arange(max_bin + 1, dtype=float)
+
+        E_real_interp = np.interp(
+            r_flat,
+            r_bins,
+            E_radial.real,
+            left=E_radial.real[0],
+            right=E_radial.real[-1],
+        )
+        E_imag_interp = np.interp(
+            r_flat,
+            r_bins,
+            E_radial.imag,
+            left=E_radial.imag[0],
+            right=E_radial.imag[-1],
+        )
+
+        asf_radial = (E_real_interp + 1j * E_imag_interp).reshape(pupil_samples, pupil_samples)
+
+        ipsf_stack_complex[i, :, :] = asf_radial
 
     # Create a custom interpolator for fast lookups later.
     interpolator = IPSFZInterpolator(z_values, ipsf_stack_complex)
