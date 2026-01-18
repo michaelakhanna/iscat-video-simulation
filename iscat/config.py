@@ -240,7 +240,7 @@ PARAMS = {
     #   True  -> simulate shot noise based on the local intensity and
     #            shot_noise_scaling_factor.
     #   False -> no Poisson noise.
-    "shot_noise_enabled": True,
+    "shot_noise_enabled": False,
 
     # Scaling factor for the strength of Poisson (shot) noise.
     # Non-negative float:

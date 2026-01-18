@@ -1,5 +1,4 @@
 import numpy as np
-import cv2
 from tqdm import tqdm
 from scipy.special import j1
 
@@ -126,6 +125,38 @@ def estimate_psf_padding_radius_pixels(params):
     return max(padding_pixels, 0)
 
 
+def downsample_mean(image: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Downsample a 2D image by an integer factor using block averaging.
+
+    This models integration over camera pixels and avoids the anisotropic
+    interpolation behavior of cv2.resize.
+
+    Args:
+        image (np.ndarray): 2D input array of shape (H, W).
+        factor (int): Integer downsampling factor (>0). For factor == 1,
+            the input is returned unchanged.
+
+    Returns:
+        np.ndarray: 2D array of shape (H/factor, W/factor).
+    """
+    if factor == 1:
+        return image
+
+    if factor <= 0:
+        raise ValueError("Downsampling factor must be a positive integer.")
+
+    h, w = image.shape
+    if h % factor != 0 or w % factor != 0:
+        raise ValueError(
+            f"Image shape {(h, w)} is not divisible by factor={factor}."
+        )
+
+    # Reshape into blocks and average over the block dimensions.
+    image_reshaped = image.reshape(h // factor, factor, w // factor, factor)
+    return image_reshaped.mean(axis=(1, 3))
+
+
 def generate_video_and_masks(params, trajectories, ipsf_interpolators):
     """
     Generates all video frames and segmentation masks by placing particles according
@@ -186,9 +217,15 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
 
     img_size = params["image_size_pixels"]
     pixel_size_nm = params["pixel_size_nm"]
-    os_factor = params["psf_oversampling_factor"]
+    os_factor = int(params["psf_oversampling_factor"])
     final_size = (img_size, img_size)
     os_size = img_size * os_factor
+
+    # Real-space pixel size of the PSF returned by the interpolators.
+    # This mirrors the construction in optics.compute_ipsf_stack.
+    pupil_samples = int(params["pupil_samples"])
+    psf_size_nm = img_size * pixel_size_nm
+    psf_pixel_size_nm = psf_size_nm / (pupil_samples * os_factor)
 
     # --- Determine PSF padding to eliminate np.roll periodicity in the FOV ---
     # We render on a larger oversampled canvas and crop the central os_size×os_size
@@ -199,6 +236,19 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
     os_canvas_size = os_size + 2 * psf_padding_radius
     crop_start = psf_padding_radius
     crop_end = crop_start + os_size
+
+    # --- Precompute oversampled radius grid for radial PSF upsampling ---
+    # This avoids anisotropic interpolation (e.g., cv2.resize) and preserves
+    # the radial symmetry of the PSF when mapping it onto the oversampled FOV.
+    if os_factor > 1:
+        yy_os, xx_os = np.indices((os_size, os_size))
+        center_os = os_size // 2
+        r_os_pix_float = np.sqrt((xx_os - center_os) ** 2 + (yy_os - center_os) ** 2)
+        # Physical radius at each oversampled pixel center (nm)
+        r_os_nm_flat = (r_os_pix_float.ravel()) * (pixel_size_nm / os_factor)
+    else:
+        yy_os = xx_os = None
+        r_os_nm_flat = None
 
     # --- Stationary reference field and background maps (base) ---
     # These maps encode the spatially varying reference field and background
@@ -374,22 +424,50 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
                 # Get the pre-computed scattered field (iPSF) for the particle's z-position.
                 E_sca_2D = ipsf_interpolators[i]([pz])[0]
 
-                # Upscale to the oversampled resolution for higher accuracy placement.
-                resized_real = cv2.resize(
-                    np.real(E_sca_2D),
-                    (os_size, os_size),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-                resized_imag = cv2.resize(
-                    np.imag(E_sca_2D),
-                    (os_size, os_size),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-                E_sca_2D_rescaled = resized_real + 1j * resized_imag
+                # Radially upsample the PSF to the oversampled field-of-view resolution.
+                # This avoids anisotropic 2D interpolation and maintains the intended
+                # rotational symmetry of the PSF.
+                if os_factor > 1:
+                    psf_size = E_sca_2D.shape[0]
+                    center_psf = psf_size // 2
+
+                    # Extract a 1D radial profile from the central row. Because the PSF
+                    # slices are radially symmetrized in optics.compute_ipsf_stack,
+                    # any radial line is representative.
+                    E_radial_line = E_sca_2D[center_psf, center_psf:]
+
+                    max_bin_psf = E_radial_line.size - 1
+                    if max_bin_psf <= 0:
+                        E_sca_2D_rescaled = np.zeros((os_size, os_size), dtype=np.complex128)
+                    else:
+                        # Radii (nm) corresponding to the PSF radial samples.
+                        r_bins_nm = np.arange(max_bin_psf + 1, dtype=float) * psf_pixel_size_nm
+
+                        # Interpolate the radial profile onto the oversampled radius grid.
+                        E_real_interp = np.interp(
+                            r_os_nm_flat,
+                            r_bins_nm,
+                            E_radial_line.real,
+                            left=E_radial_line.real[0],
+                            right=0.0,
+                        )
+                        E_imag_interp = np.interp(
+                            r_os_nm_flat,
+                            r_bins_nm,
+                            E_radial_line.imag,
+                            left=E_radial_line.imag[0],
+                            right=0.0,
+                        )
+                        E_sca_2D_rescaled = (
+                            E_real_interp + 1j * E_imag_interp
+                        ).reshape(os_size, os_size)
+                else:
+                    # No oversampling: work directly at the final resolution.
+                    E_sca_2D_rescaled = E_sca_2D
 
                 # --- Position the PSF on the padded oversampled canvas using np.roll ---
                 #
-                # The PSF returned by the interpolator is centered in the os_size×os_size
+                # The PSF (possibly oversampled) is centered in the os_size×os_size
                 # array. We first embed this PSF into the central os_size×os_size region
                 # of the larger padded canvas, corresponding to the field of view
                 # centered in the larger array. We then use np.roll to translate this
@@ -449,9 +527,9 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
                     np.abs(E_ref_os + E_sca_particle_blurred_fov) ** 2
                     - E_ref_intensity_os
                 )
-                contrast_final = cv2.resize(
-                    contrast_os, final_size, interpolation=cv2.INTER_AREA
-                )
+
+                # Downsample to the final camera resolution using block averaging.
+                contrast_final = downsample_mean(contrast_os, os_factor)
 
                 # Compute the human trackability confidence and gate mask generation
                 # only if trackability is enabled. When disabled, generate masks
@@ -496,7 +574,9 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
         # Interfere the total scattered field with the (possibly spatially varying)
         # reference field to get intensity on the oversampled field of view.
         intensity_os = np.abs(E_ref_os + E_sca_total_fov) ** 2
-        intensity = cv2.resize(intensity_os, final_size, interpolation=cv2.INTER_AREA)
+
+        # Downsample to the final camera resolution using block averaging.
+        intensity = downsample_mean(intensity_os, os_factor)
 
         # Scale intensity to camera counts using the per-pixel background map.
         # For a spatially varying reference field, the physically consistent
