@@ -1,4 +1,5 @@
 import numpy as np
+import cv2
 from tqdm import tqdm
 from scipy.special import j1
 
@@ -125,38 +126,6 @@ def estimate_psf_padding_radius_pixels(params):
     return max(padding_pixels, 0)
 
 
-def downsample_mean(image: np.ndarray, factor: int) -> np.ndarray:
-    """
-    Downsample a 2D image by an integer factor using block averaging.
-
-    This models integration over camera pixels and avoids the anisotropic
-    interpolation behavior of cv2.resize.
-
-    Args:
-        image (np.ndarray): 2D input array of shape (H, W).
-        factor (int): Integer downsampling factor (>0). For factor == 1,
-            the input is returned unchanged.
-
-    Returns:
-        np.ndarray: 2D array of shape (H/factor, W/factor).
-    """
-    if factor == 1:
-        return image
-
-    if factor <= 0:
-        raise ValueError("Downsampling factor must be a positive integer.")
-
-    h, w = image.shape
-    if h % factor != 0 or w % factor != 0:
-        raise ValueError(
-            f"Image shape {(h, w)} is not divisible by factor={factor}."
-        )
-
-    # Reshape into blocks and average over the block dimensions.
-    image_reshaped = image.reshape(h // factor, factor, w // factor, factor)
-    return image_reshaped.mean(axis=(1, 3))
-
-
 def generate_video_and_masks(params, trajectories, ipsf_interpolators):
     """
     Generates all video frames and segmentation masks by placing particles according
@@ -217,15 +186,9 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
 
     img_size = params["image_size_pixels"]
     pixel_size_nm = params["pixel_size_nm"]
-    os_factor = int(params["psf_oversampling_factor"])
+    os_factor = params["psf_oversampling_factor"]
     final_size = (img_size, img_size)
     os_size = img_size * os_factor
-
-    # Real-space pixel size of the PSF returned by the interpolators.
-    # This mirrors the construction in optics.compute_ipsf_stack.
-    pupil_samples = int(params["pupil_samples"])
-    psf_size_nm = img_size * pixel_size_nm
-    psf_pixel_size_nm = psf_size_nm / (pupil_samples * os_factor)
 
     # --- Determine PSF padding to eliminate np.roll periodicity in the FOV ---
     # We render on a larger oversampled canvas and crop the central os_size×os_size
@@ -238,17 +201,16 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
     crop_end = crop_start + os_size
 
     # --- Precompute oversampled radius grid for radial PSF upsampling ---
-    # This avoids anisotropic interpolation (e.g., cv2.resize) and preserves
-    # the radial symmetry of the PSF when mapping it onto the oversampled FOV.
+    # This grid is used to radially resample the PSF from the pupil_samples×pupil_samples
+    # grid to the oversampled os_size×os_size grid without introducing anisotropy
+    # from separable interpolation (e.g., cv2.resize).
     if os_factor > 1:
         yy_os, xx_os = np.indices((os_size, os_size))
         center_os = os_size // 2
         r_os_pix_float = np.sqrt((xx_os - center_os) ** 2 + (yy_os - center_os) ** 2)
-        # Physical radius at each oversampled pixel center (nm)
-        r_os_nm_flat = (r_os_pix_float.ravel()) * (pixel_size_nm / os_factor)
+        r_os_flat = r_os_pix_float.ravel()
     else:
-        yy_os = xx_os = None
-        r_os_nm_flat = None
+        r_os_flat = None
 
     # --- Stationary reference field and background maps (base) ---
     # These maps encode the spatially varying reference field and background
@@ -303,9 +265,6 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
             pattern_final_base /= mean_final
 
     # --- Bit depth and camera count handling ---
-    # The raw simulated frames are stored as uint16 but their meaningful dynamic
-    # range is controlled by PARAMS["bit_depth"]. This allows us to simulate
-    # 12-bit, 14-bit, or 16-bit cameras while keeping the storage format simple.
     bit_depth = params["bit_depth"]
     if not isinstance(bit_depth, int) or bit_depth <= 0:
         raise ValueError("PARAMS['bit_depth'] must be a positive integer.")
@@ -334,9 +293,6 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
     trackability_enabled = bool(params.get("trackability_enabled", True))
 
     # Initialize the human trackability confidence model if masks are enabled.
-    # The model may still be constructed when trackability_enabled is False, but
-    # in that case its state is not allowed to affect mask generation or the
-    # video length.
     if params["mask_generation_enabled"]:
         trackability_model = TrackabilityModel(params, num_particles)
         trackability_threshold = params.get("trackability_confidence_threshold", 0.8)
@@ -352,15 +308,11 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
     for f in tqdm(range(num_frames)):
         # --- Per-frame reference field and background maps ---
         if use_dynamic_contrast:
-            # Compute the frame-specific contrast scale factor alpha_f and apply
-            # it to the deviation of the base pattern from unity, keeping the
-            # mean of the pattern at 1.0 for all frames.
             alpha_f = compute_contrast_scale_for_frame(params, f, num_frames)
 
             pattern_os_f = 1.0 + alpha_f * (pattern_os_base - 1.0)
             pattern_final_f = 1.0 + alpha_f * (pattern_final_base - 1.0)
 
-            # Ensure strictly positive patterns to avoid numerical issues.
             pattern_os_f = np.maximum(pattern_os_f, 1e-8)
             pattern_final_f = np.maximum(pattern_final_f, 1e-8)
 
@@ -370,8 +322,6 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
             E_ref_intensity_final = (E_ref_amplitude ** 2) * pattern_final_f
             background_final = background_intensity * pattern_final_f
         else:
-            # Static contrast: reuse the base maps for every frame. This path
-            # preserves the original behavior exactly.
             E_ref_os = E_ref_os_base
             E_ref_intensity_os = E_ref_intensity_os_base
             E_ref_intensity_final = E_ref_intensity_final_base
@@ -389,22 +339,16 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
 
         # --- Subsample rendering for motion blur ---
         for s in range(num_subsamples):
-            # Sample particle positions uniformly over the exposure window
-            # centered on the frame midpoint time.
             frame_center_time = (f + 0.5) * frame_interval_s
             start_time = frame_center_time - 0.5 * exposure_time_s
             current_time = start_time + (s + 0.5) * sub_dt
 
-            # Convert the continuous time to indices in the discrete trajectory
-            # array, which is sampled at the frame interval.
             normalized_time = current_time / frame_interval_s
             frame_idx_floor = int(np.floor(normalized_time))
             if frame_idx_floor < 0:
                 frame_idx_floor = 0
 
             if frame_idx_floor >= num_frames - 1:
-                # Use the last available trajectory sample when we are at or
-                # beyond the final stored time.
                 frame_idx_floor = num_frames - 1
                 frame_idx_ceil = num_frames - 1
                 interp_factor = 0.0
@@ -412,7 +356,6 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
                 frame_idx_ceil = frame_idx_floor + 1
                 interp_factor = normalized_time - frame_idx_floor
 
-            # Linearly interpolate particle positions between trajectory points.
             current_pos_nm = (
                 (1.0 - interp_factor) * trajectories[:, frame_idx_floor, :]
                 + interp_factor * trajectories[:, frame_idx_ceil, :]
@@ -424,36 +367,40 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
                 # Get the pre-computed scattered field (iPSF) for the particle's z-position.
                 E_sca_2D = ipsf_interpolators[i]([pz])[0]
 
-                # Radially upsample the PSF to the oversampled field-of-view resolution.
-                # This avoids anisotropic 2D interpolation and maintains the intended
-                # rotational symmetry of the PSF.
+                # Upscale to the oversampled resolution for higher accuracy placement.
+                # Instead of cv2.resize (separable, axis-biased), we radially resample
+                # the PSF from the central radial profile to preserve rotational symmetry.
                 if os_factor > 1:
                     psf_size = E_sca_2D.shape[0]
                     center_psf = psf_size // 2
 
-                    # Extract a 1D radial profile from the central row. Because the PSF
-                    # slices are radially symmetrized in optics.compute_ipsf_stack,
-                    # any radial line is representative.
+                    # 1D radial profile from the central row. compute_ipsf_stack has
+                    # already enforced radial symmetry, so any radial line is valid.
                     E_radial_line = E_sca_2D[center_psf, center_psf:]
 
                     max_bin_psf = E_radial_line.size - 1
                     if max_bin_psf <= 0:
                         E_sca_2D_rescaled = np.zeros((os_size, os_size), dtype=np.complex128)
                     else:
-                        # Radii (nm) corresponding to the PSF radial samples.
-                        r_bins_nm = np.arange(max_bin_psf + 1, dtype=float) * psf_pixel_size_nm
+                        # Radii in PSF pixel units: 0,1,2,...,max_bin_psf
+                        r_bins = np.arange(max_bin_psf + 1, dtype=float)
 
-                        # Interpolate the radial profile onto the oversampled radius grid.
+                        # Map oversampled radii (os_size grid) back to PSF radii.
+                        # This uses the same index-space scaling as a 512->os_size resize:
+                        #   r_psf = r_os * (psf_size / os_size)
+                        scale = psf_size / float(os_size)
+                        r_src = r_os_flat * scale
+
                         E_real_interp = np.interp(
-                            r_os_nm_flat,
-                            r_bins_nm,
+                            r_src,
+                            r_bins,
                             E_radial_line.real,
                             left=E_radial_line.real[0],
                             right=0.0,
                         )
                         E_imag_interp = np.interp(
-                            r_os_nm_flat,
-                            r_bins_nm,
+                            r_src,
+                            r_bins,
                             E_radial_line.imag,
                             left=E_radial_line.imag[0],
                             right=0.0,
@@ -466,37 +413,21 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
                     E_sca_2D_rescaled = E_sca_2D
 
                 # --- Position the PSF on the padded oversampled canvas using np.roll ---
-                #
-                # The PSF (possibly oversampled) is centered in the os_size×os_size
-                # array. We first embed this PSF into the central os_size×os_size region
-                # of the larger padded canvas, corresponding to the field of view
-                # centered in the larger array. We then use np.roll to translate this
-                # pattern so its center coincides with the particle's (x, y) position.
-                #
-                # Because we have added sufficient padding around the field of view,
-                # any circular wrap-around from np.roll occurs only in the padded
-                # margins and never contaminates the central region that will be
-                # cropped and used for the final video.
                 psf_canvas.fill(0.0)
                 psf_canvas[crop_start:crop_end, crop_start:crop_end] = E_sca_2D_rescaled
 
                 center_x_px = int(round(px / pixel_size_nm * os_factor))
                 center_y_px = int(round(py / pixel_size_nm * os_factor))
 
-                # Compute integer shifts relative to the optical center of the field of view
-                # in the oversampled coordinates. This is identical to the previous logic,
-                # but the shift is now applied to the padded canvas.
                 shift_x = center_x_px - os_size // 2
                 shift_y = center_y_px - os_size // 2
 
-                # Circularly shift the PSF to the particle position on the padded canvas.
                 E_sca_particle_inst = np.roll(
                     psf_canvas,
                     shift=(shift_y, shift_x),
                     axis=(0, 1),
                 )
 
-                # Apply signal multiplier and accumulate for motion blur.
                 blurred_particle_fields[i] += (
                     E_sca_particle_inst * params["particle_signal_multipliers"][i]
                 )
@@ -508,34 +439,26 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
         # --- Mask Generation for this Frame ---
         if params["mask_generation_enabled"]:
             for i in range(num_particles):
-                # When trackability gating is enabled, skip particles that have
-                # already been declared "lost" by the trackability model. When
-                # disabled, always attempt a mask for every particle in every frame.
                 if trackability_enabled and trackability_model.is_particle_lost(i):
                     continue
 
-                # Crop the particle's field back to the central oversampled field of view.
                 E_sca_particle_blurred_canvas = blurred_particle_fields[i]
                 E_sca_particle_blurred_fov = E_sca_particle_blurred_canvas[
                     crop_start:crop_end, crop_start:crop_end
                 ]
 
-                # Contrast is the change in intensity caused by the particle's scattered field.
-                # Here we use the oversampled reference field map so that future spatially
-                # varying backgrounds are handled correctly.
                 contrast_os = (
                     np.abs(E_ref_os + E_sca_particle_blurred_fov) ** 2
                     - E_ref_intensity_os
                 )
+                # Keep your original intensity downsampling behavior (cv2.INTER_AREA)
+                # so the overall look remains close to your previous videos.
+                contrast_final = cv2.resize(
+                    contrast_os, final_size, interpolation=cv2.INTER_AREA
+                )
 
-                # Downsample to the final camera resolution using block averaging.
-                contrast_final = downsample_mean(contrast_os, os_factor)
-
-                # Compute the human trackability confidence and gate mask generation
-                # only if trackability is enabled. When disabled, generate masks
-                # unconditionally for all particles and frames.
                 if trackability_enabled:
-                    position_nm = trajectories[i, f, :]  # [x, y, z] at the frame time
+                    position_nm = trajectories[i, f, :]
                     confidence = trackability_model.update_and_compute_confidence(
                         particle_index=i,
                         frame_index=f,
@@ -551,12 +474,8 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
                             frame_index=f,
                         )
                     else:
-                        # Once a particle is considered lost, its mask is no longer generated
-                        # for the remainder of the video.
                         trackability_model.lost[i] = True
                 else:
-                    # Trackability disabled: the model must not gate masks. Always
-                    # generate and save a mask for this particle in this frame.
                     generate_and_save_mask_for_particle(
                         contrast_image=contrast_final,
                         params=params,
@@ -565,34 +484,18 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
                     )
 
         # --- Final Video Frame Generation ---
-        # Sum the motion-blurred fields from all particles on the padded canvas.
         E_sca_total_canvas = np.sum(blurred_particle_fields, axis=0)
 
-        # Crop back to the central oversampled field of view.
         E_sca_total_fov = E_sca_total_canvas[crop_start:crop_end, crop_start:crop_end]
 
-        # Interfere the total scattered field with the (possibly spatially varying)
-        # reference field to get intensity on the oversampled field of view.
         intensity_os = np.abs(E_ref_os + E_sca_total_fov) ** 2
+        # Keep original cv2.resize for final intensity as well for now.
+        intensity = cv2.resize(intensity_os, final_size, interpolation=cv2.INTER_AREA)
 
-        # Downsample to the final camera resolution using block averaging.
-        intensity = downsample_mean(intensity_os, os_factor)
-
-        # Scale intensity to camera counts using the per-pixel background map.
-        # For a spatially varying reference field, the physically consistent
-        # mapping is:
-        #
-        #   intensity_scaled(x, y) = background_final(x, y)
-        #                            * intensity(x, y) / E_ref_intensity_final(x, y)
-        #
-        # This reduces to the original behavior when E_ref_intensity_final = 1,
-        # and guarantees non-negative intensities everywhere.
         if np.max(intensity) > 0:
-            # Avoid division by zero in any degenerate case.
             E_ref_intensity_safe = np.maximum(E_ref_intensity_final, 1e-12)
             intensity_scaled = background_final * (intensity / E_ref_intensity_safe)
         else:
-            # Degenerate case: no contrast; fall back to pure background.
             intensity_scaled = background_final.copy()
 
         signal_frame_noisy = add_noise(intensity_scaled, params)
@@ -600,17 +503,12 @@ def generate_video_and_masks(params, trajectories, ipsf_interpolators):
             np.clip(signal_frame_noisy, 0, max_camera_count).astype(np.uint16)
         )
 
-        # Generate a corresponding noisy reference frame for background subtraction.
         reference_frame_ideal = background_final.copy()
         reference_frame_noisy = add_noise(reference_frame_ideal, params)
         all_reference_frames.append(
             np.clip(reference_frame_noisy, 0, max_camera_count).astype(np.uint16)
         )
 
-        # If all particles are lost according to the trackability model, we can
-        # terminate video generation early. This early termination must only
-        # occur when trackability gating is enabled; when disabled, the video
-        # always runs for the full duration.
         if (
             params["mask_generation_enabled"]
             and trackability_enabled
