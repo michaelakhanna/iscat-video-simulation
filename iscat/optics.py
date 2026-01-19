@@ -1,3 +1,4 @@
+# File: optics.py
 import numpy as np
 from scipy.special import jn, yn
 from scipy.fft import fft2, ifft2, fftshift, ifftshift
@@ -259,9 +260,17 @@ def compute_ipsf_stack(params, particle_diameter_nm, particle_refractive_index):
     m = particle_refractive_index / n_medium
     radius_nm = particle_diameter_nm / 2
     x = 2 * np.pi * radius_nm / wavelength_medium_nm
+
+    # mu = cos(theta); for invalid angles (sin_theta > 1) we leave mu = 0.0,
+    # but those points are suppressed by the aperture mask anyway.
     mu = np.zeros_like(cos_theta)
     mu[valid_mask] = cos_theta[valid_mask]
-    S1_vec, S2_vec = np.vectorize(mie_S1_S2)(m, x, mu)
+
+    # Use np.vectorize with explicit complex output types so that S1_vec and
+    # S2_vec are true numeric (complex128) arrays, not object arrays. This is
+    # critical for downstream FFT operations to behave correctly.
+    mie_vec = np.vectorize(mie_S1_S2, otypes=[np.complex128, np.complex128])
+    S1_vec, S2_vec = mie_vec(m, x, mu)
 
     # --- Define aberration and apodization functions ---
     z_values = np.arange(
