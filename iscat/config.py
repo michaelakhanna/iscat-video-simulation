@@ -6,7 +6,7 @@ PARAMS = {
     # --- IMAGE & VIDEO ---
     # Linear size (both width and height) of the square output frames in pixels.
     # Must be a positive integer (e.g., 512, 1024).
-    "image_size_pixels": 1024,
+    "image_size_pixels": 512,
 
     # Physical side length of a single camera pixel in nanometers.
     # Must be a positive float. Typical values are ~100–600 nm depending on the
@@ -74,7 +74,7 @@ PARAMS = {
     # particle to continue receiving masks when trackability is enabled.
     # If the confidence for a particle falls below this threshold, that
     # particle is marked "lost" and no further masks are generated for it.
-    "trackability_confidence_threshold": 0.7,
+    "trackability_confidence_threshold": 0.3,
 
     # Master switch for the Human Trackability Confidence Model.
     #   True  -> the TrackabilityModel is used to decide whether to generate
@@ -266,7 +266,7 @@ PARAMS = {
 
     # Standard deviation of Gaussian readout noise in camera counts.
     # Non-negative float; only used when gaussian_noise_enabled is True.
-    "read_noise_std": 17,
+    "read_noise_std": 3,
 
     # Method for converting raw signal/reference frames into contrast frames
     # during post-processing. Supported string options:
@@ -317,7 +317,7 @@ PARAMS = {
     #   "nanopillars_v1"  -> array of circular gold pillars on a square grid.
     #   "none"            -> force a uniform background even if
     #                        chip_pattern_enabled is True.
-    "chip_pattern_model": "nanopillars_v1",
+    "chip_pattern_model": "gold_holes_v1",
 
     # Contrast evolution model for the chip pattern over the duration of the
     # video. Supported string options:
@@ -356,7 +356,7 @@ PARAMS = {
     #       a square grid, using the geometry specified in
     #       chip_pattern_dimensions. Pillars are treated as solid regions for
     #       Brownian dynamics; the background is fluid.
-    "chip_substrate_preset": "nanopillars",
+    "chip_substrate_preset": "default_gold_holes",
 
     # Geometry and optical-intensity parameters for the chip pattern.
     # Used when chip_pattern_model == "gold_holes_v1" or "nanopillars_v1".

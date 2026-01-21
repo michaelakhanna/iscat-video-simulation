@@ -60,7 +60,14 @@ INSTRUMENT_PRESETS: Dict[str, Dict[str, Any]] = {
     # a high-NA oil-immersion objective on a 180 mm tube lens. Other parameters
     # (e.g., chip pattern, particle properties) are inherited from the base
     # PARAMS dictionary unless explicitly overridden here.
+    #
+    # image_size_pixels is set to 512 so that, for typical chip geometries
+    # (e.g., 15 µm holes with 2 µm spacing -> 17 µm pitch), the field of view
+    # is ~62.5 µm wide at this pixel size. This yields ~3–4 holes across the
+    # FOV for the 'lab_default_gold_holes' substrate, which matches the
+    # lab-observed ~3x3 hole grid for this 60x configuration.
     "60x_nikon": {
+        "image_size_pixels": 512,
         "magnification": 60,
         "objective_model": "Plan Apo 60x, NA 1.20 DIC N2 (representative)",
         "pixel_size_nm": 122.0,
