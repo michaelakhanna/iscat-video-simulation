@@ -14,6 +14,20 @@ Core responsibilities:
       unique, organized output locations.
     - Invoke run_simulation(params) once per video.
 
+Randomness & reproducibility:
+    - A dataset-level seed (random_seed) controls a master NumPy Generator.
+    - For each video, a per-video seed is drawn from this master Generator.
+    - That per-video seed is used to:
+        * Seed the legacy global np.random RNG, which is used throughout
+          the core simulation (Brownian motion, random aberrations, detector
+          noise, etc.).
+        * Construct a per-video Generator for experiment-level parameter
+          sampling (e.g., in experiment presets like 'nanoplastic_surface').
+
+    As a result, providing the same random_seed and the same dataset
+    configuration (num_videos, presets, etc.) makes the entire dataset
+    generation process fully reproducible.
+
 The underlying simulation (config, trajectory, optics, rendering, etc.)
 remains unchanged. This module only orchestrates multiple runs.
 """
@@ -83,11 +97,15 @@ def _build_params_for_video(
         - Else:
             Use a deepcopy of config.PARAMS as-is.
 
+    The rng argument is a per-video NumPy Generator. It is used only for
+    experiment presets (via create_params_for_experiment). Instrument presets
+    and the base config do not depend on rng.
+
     Args:
         video_index (int): Zero-based index of the video being generated.
             Currently only used for debugging or future extensions.
-        rng (np.random.Generator): Random number generator used for experiment
-            preset sampling.
+        rng (np.random.Generator): Per-video random number generator used for
+            experiment-level parameter sampling when experiment_preset is set.
         experiment_preset (Optional[str]): Name of the experiment preset, or
             None if no experiment preset should be applied.
         instrument_preset (Optional[str]): Name of the instrument preset, or
@@ -157,6 +175,21 @@ def generate_dataset(
         - Each video's masks are isolated in their own subtree, avoiding any
           collisions between runs.
 
+    Randomness and reproducibility:
+        - A dataset-level master RNG is constructed as:
+              master_rng = np.random.default_rng(random_seed)
+        - For each video, a per-video integer seed is drawn from master_rng.
+        - That per-video seed is used to:
+              * Seed the legacy global np.random RNG, which is used by the
+                core simulation (Brownian motion, random aberrations, detector
+                noise, etc.).
+              * Construct a per-video Generator passed to experiment presets
+                for parameter sampling.
+
+        Providing the same random_seed (and the same num_videos, presets, and
+        other arguments) therefore makes the entire dataset generation process
+        deterministic and reproducible.
+
     Args:
         num_videos (int): Number of videos to generate. Must be >= 1.
         experiment_preset (Optional[str]): Name of the experiment preset to
@@ -168,11 +201,11 @@ def generate_dataset(
         base_output_dir (Optional[str]): Base directory under which all videos
             and masks will be written. If None, defaults to a directory named
             "iscat_dataset" on the user's Desktop.
-        random_seed (Optional[int]): Optional seed for the NumPy random number
-            generator used for experiment-level parameter sampling. This does
-            not control all randomness within the simulation (Brownian motion,
-            optical aberration noise, etc.), which currently use the global
-            NumPy RNG.
+        random_seed (Optional[int]): Optional seed for the dataset-level NumPy
+            random number generator. When provided, all random choices in both
+            experiment-level parameter sampling and the core simulation
+            (Brownian motion, optical aberration randomness, detector noise,
+            etc.) become reproducible across runs with the same configuration.
 
     Raises:
         ValueError: If num_videos < 1.
@@ -188,8 +221,12 @@ def generate_dataset(
     os.makedirs(video_dir, exist_ok=True)
     os.makedirs(masks_root_dir, exist_ok=True)
 
-    # Local RNG used for experiment-level parameter sampling.
-    rng = np.random.default_rng(random_seed)
+    # Dataset-level RNG used for:
+    #   - Deriving per-video seeds.
+    #   - Experiment-level parameter sampling (via per-video Generators).
+    master_rng = np.random.default_rng(random_seed)
+    # Limit seeds to a safe 32-bit range compatible with np.random.seed.
+    max_seed_value = 2 ** 31
 
     print(
         f"Generating {num_videos} video(s) "
@@ -200,10 +237,22 @@ def generate_dataset(
     for video_index in range(num_videos):
         print(f"\n=== Generating video {video_index + 1} / {num_videos} ===")
 
+        # Draw a per-video seed from the dataset-level RNG.
+        video_seed = int(master_rng.integers(0, max_seed_value))
+
+        # Seed the legacy global np.random RNG so that all internal randomness
+        # in the core simulation (Brownian motion, PSF aberrations, detector
+        # noise, etc.) is reproducible for this video.
+        np.random.seed(video_seed)
+
+        # Construct a per-video Generator for experiment-level parameter
+        # sampling (e.g., in experiment presets).
+        video_rng = np.random.default_rng(video_seed)
+
         # Build a fresh parameter dictionary for this video.
         params = _build_params_for_video(
             video_index=video_index,
-            rng=rng,
+            rng=video_rng,
             experiment_preset=experiment_preset,
             instrument_preset=instrument_preset,
         )
@@ -278,8 +327,10 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Optional seed for the NumPy random number generator used for "
-            "experiment-level parameter sampling."
+            "Optional dataset-level random seed. When provided, all random "
+            "choices in experiment-level parameter sampling and in the core "
+            "simulation (Brownian motion, aberrations, detector noise, etc.) "
+            "become reproducible across runs with the same configuration."
         ),
     )
     return parser.parse_args()
@@ -299,6 +350,9 @@ def main() -> None:
         # Generate 5 videos using the '60x_nikon' instrument preset, writing
         # outputs under a custom directory:
         python dataset_generator.py --num_videos 5 --instrument 60x_nikon --output_dir /path/to/dataset
+
+        # Generate a reproducible dataset with a fixed random seed:
+        python dataset_generator.py --num_videos 10 --experiment nanoplastic_surface --seed 12345
     """
     args = _parse_args()
     generate_dataset(
