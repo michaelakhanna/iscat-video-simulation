@@ -313,10 +313,11 @@ PARAMS = {
 
     # Model that defines the geometry / structure of the chip pattern.
     # Currently supported string options:
-    #   "gold_holes_v1" -> gold film with circular holes on a square grid.
-    #   "none"          -> force a uniform background even if
-    #                      chip_pattern_enabled is True.
-    "chip_pattern_model": "gold_holes_v1",
+    #   "gold_holes_v1"   -> gold film with circular holes on a square grid.
+    #   "nanopillars_v1"  -> array of circular gold pillars on a square grid.
+    #   "none"            -> force a uniform background even if
+    #                        chip_pattern_enabled is True.
+    "chip_pattern_model": "nanopillars_v1",
 
     # Contrast evolution model for the chip pattern over the duration of the
     # video. Supported string options:
@@ -349,12 +350,18 @@ PARAMS = {
     #           hole_diameter_um            = 15.0
     #           hole_edge_to_edge_spacing_um = 2.0
     #           hole_depth_nm               = 20.0  (5 nm Cr + 15 nm Au)
-    "chip_substrate_preset": "default_gold_holes",
+    #
+    #   "nanopillars"            ->
+    #       Circular gold pillars on a non-reflective substrate, arranged on
+    #       a square grid, using the geometry specified in
+    #       chip_pattern_dimensions. Pillars are treated as solid regions for
+    #       Brownian dynamics; the background is fluid.
+    "chip_substrate_preset": "nanopillars",
 
     # Geometry and optical-intensity parameters for the chip pattern.
-    # Used when chip_pattern_model == "gold_holes_v1".
+    # Used when chip_pattern_model == "gold_holes_v1" or "nanopillars_v1".
     #
-    # Fields:
+    # Fields for the gold-film-with-holes pattern:
     #   hole_diameter_um (float, >0):
     #       Diameter of the circular holes in micrometers.
     #
@@ -374,15 +381,44 @@ PARAMS = {
     #   gold_intensity_factor (float, >0):
     #       Relative background intensity in gold regions before normalization.
     #
+    # Fields for the nanopillar pattern:
+    #   pillar_diameter_um (float, >0):
+    #       Diameter of the circular nanopillars in micrometers.
+    #
+    #   pillar_edge_to_edge_spacing_um (float, >=0):
+    #       Spacing between adjacent pillar edges (µm). Determines the
+    #       center-to-center pitch:
+    #           pitch_um = pillar_diameter_um + pillar_edge_to_edge_spacing_um
+    #
+    #   pillar_height_nm (float, >0):
+    #       Pillar height / total metal thickness in nanometers. Currently
+    #       used as a bookkeeping parameter for future optical refinements.
+    #
+    #   pillar_intensity_factor (float, >0):
+    #       Relative background intensity on top of pillars before
+    #       normalization.
+    #
+    #   background_intensity_factor (float, >0):
+    #       Relative background intensity in regions outside pillars before
+    #       normalization.
+    #
     # The generated pattern map is normalized to unit mean so that the global
     # brightness remains controlled by "background_intensity". Spatial
     # variations then modulate both the reference field and detector noise.
     "chip_pattern_dimensions": {
+        # Gold-film-with-holes defaults
         "hole_diameter_um": 15.0,
         "hole_edge_to_edge_spacing_um": 2.0,
         "hole_depth_nm": 20.0,           # 5 nm Cr + 15 nm Au is a typical total
         "hole_intensity_factor": 0.7,    # Holes slightly darker than gold (reflection geometry)
         "gold_intensity_factor": 1.0,    # Reference intensity level in gold regions
+
+        # Nanopillar defaults
+        "pillar_diameter_um": 1.0,
+        "pillar_edge_to_edge_spacing_um": 2.0,
+        "pillar_height_nm": 20.0,        # Total metal thickness for pillars (bookkeeping)
+        "pillar_intensity_factor": 1.3,  # Pillars slightly brighter than background
+        "background_intensity_factor": 1.0,
     },
 }
 

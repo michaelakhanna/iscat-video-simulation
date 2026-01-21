@@ -1,4 +1,3 @@
-# File: chip_pattern.py
 import math
 import numpy as np
 
@@ -121,6 +120,56 @@ def _generate_gold_hole_pattern(
     return pattern
 
 
+def _generate_nanopillar_pattern(
+    shape: tuple,
+    pixel_size_nm: float,
+    pillar_diameter_um: float,
+    pillar_edge_to_edge_spacing_um: float,
+    pillar_intensity_factor: float,
+    background_intensity_factor: float,
+) -> np.ndarray:
+    """
+    Generate a dimensionless intensity pattern map for a nanopillar array.
+
+    Geometry:
+        - Circular pillars of diameter `pillar_diameter_um`.
+        - Square grid with center-to-center pitch:
+              pitch_um = pillar_diameter_um + pillar_edge_to_edge_spacing_um
+
+    The pattern returned by this helper labels pixels inside a pillar with
+    `pillar_intensity_factor` and pixels in the background with
+    `background_intensity_factor`, followed by a normalization to unit mean.
+
+    Implementation detail:
+        This uses the same circular-lattice generator as the gold-hole pattern,
+        but interprets the "hole" region as the pillar region and the "gold"
+        region as the background.
+
+    Args:
+        shape (tuple[int, int]): (height, width) of the desired pattern map.
+        pixel_size_nm (float): Physical pixel size in nanometers for this grid.
+        pillar_diameter_um (float): Pillar diameter in micrometers.
+        pillar_edge_to_edge_spacing_um (float): Spacing between pillar edges
+            in micrometers.
+        pillar_intensity_factor (float): Relative background intensity on top
+            of pillars.
+        background_intensity_factor (float): Relative background intensity in
+            regions outside pillars.
+
+    Returns:
+        np.ndarray: 2D array of shape `shape`, dtype float, dimensionless
+            multiplicative factors with mean ~1.0.
+    """
+    return _generate_gold_hole_pattern(
+        shape=shape,
+        pixel_size_nm=pixel_size_nm,
+        hole_diameter_um=pillar_diameter_um,
+        hole_edge_to_edge_spacing_um=pillar_edge_to_edge_spacing_um,
+        hole_intensity_factor=pillar_intensity_factor,
+        gold_intensity_factor=background_intensity_factor,
+    )
+
+
 def _resolve_gold_hole_parameters(params: dict) -> dict:
     """
     Resolve geometry and optical-intensity parameters for the gold film with
@@ -197,6 +246,76 @@ def _resolve_gold_hole_parameters(params: dict) -> dict:
     }
 
 
+def _resolve_nanopillar_parameters(params: dict) -> dict:
+    """
+    Resolve geometry and optical-intensity parameters for a circular nanopillar
+    array from the global PARAMS dictionary.
+
+    This helper is the single source of truth for:
+        - pillar_diameter_um
+        - pillar_edge_to_edge_spacing_um
+        - pillar_height_nm
+        - pillar_intensity_factor
+        - background_intensity_factor
+        - pitch_um
+        - radius_um
+    """
+    dims = params.get("chip_pattern_dimensions", {})
+    if not isinstance(dims, dict):
+        raise TypeError(
+            "PARAMS['chip_pattern_dimensions'] must be a dictionary when "
+            "using chip_pattern_model 'nanopillars_v1'."
+        )
+
+    substrate_preset_raw = params.get("chip_substrate_preset", "empty_background")
+    substrate_preset = str(substrate_preset_raw).strip().lower()
+
+    pillar_diameter_um = float(dims.get("pillar_diameter_um", 1.0))
+    pillar_edge_to_edge_spacing_um = float(
+        dims.get("pillar_edge_to_edge_spacing_um", 2.0)
+    )
+    pillar_height_nm = float(dims.get("pillar_height_nm", 20.0))  # bookkeeping only
+
+    if pillar_diameter_um <= 0.0:
+        raise ValueError(
+            "chip_pattern_dimensions['pillar_diameter_um'] must be positive."
+        )
+    if pillar_edge_to_edge_spacing_um < 0.0:
+        raise ValueError(
+            "chip_pattern_dimensions['pillar_edge_to_edge_spacing_um'] must be "
+            "non-negative."
+        )
+
+    pitch_um = pillar_diameter_um + pillar_edge_to_edge_spacing_um
+    if pitch_um <= 0.0:
+        raise ValueError(
+            "Computed pitch (pillar_diameter_um + pillar_edge_to_edge_spacing_um) "
+            "must be positive."
+        )
+
+    radius_um = pillar_diameter_um / 2.0
+
+    pillar_intensity_factor = float(dims.get("pillar_intensity_factor", 1.3))
+    background_intensity_factor = float(dims.get("background_intensity_factor", 1.0))
+
+    if pillar_intensity_factor <= 0.0 or background_intensity_factor <= 0.0:
+        raise ValueError(
+            "chip_pattern_dimensions['pillar_intensity_factor'] and "
+            "'background_intensity_factor' must be positive."
+        )
+
+    return {
+        "pillar_diameter_um": pillar_diameter_um,
+        "pillar_edge_to_edge_spacing_um": pillar_edge_to_edge_spacing_um,
+        "pillar_height_nm": pillar_height_nm,
+        "pillar_intensity_factor": pillar_intensity_factor,
+        "background_intensity_factor": background_intensity_factor,
+        "pitch_um": pitch_um,
+        "radius_um": radius_um,
+        "substrate_preset": substrate_preset,
+    }
+
+
 def _map_position_nm_to_gold_hole_unit_cell(
     params: dict,
     x_nm: float,
@@ -205,7 +324,8 @@ def _map_position_nm_to_gold_hole_unit_cell(
 ) -> tuple:
     """
     Map a lateral position (x_nm, y_nm) from the simulation's FOV coordinates
-    into the canonical unit cell of the gold-hole lattice.
+    into the canonical unit cell of a circular lattice (e.g., the gold-hole
+    lattice or a nanopillar lattice).
 
     The mapping is consistent with _generate_gold_hole_pattern and the
     Brownian-exclusion logic:
@@ -245,8 +365,7 @@ def _map_position_nm_to_gold_hole_unit_cell(
     x_um = x_nm_centered * 1e-3
     y_um = y_nm_centered * 1e-3
 
-    # Map into the unit cell using the same periodic wrapping as in
-    # _generate_gold_hole_pattern.
+    # Map into the unit cell using periodic wrapping.
     half_pitch = pitch_um / 2.0
     dx_um = (x_um + half_pitch) % pitch_um - half_pitch
     dy_um = (y_um + half_pitch) % pitch_um - half_pitch
@@ -279,6 +398,12 @@ def is_position_in_chip_solid(params: dict, x_nm: float, y_nm: float) -> bool:
           function returns True when the given (x_nm, y_nm) projects into the
           gold film (solid) and False when it lands inside a hole (fluid).
 
+        - For `chip_pattern_model == "nanopillars_v1"` with
+          `chip_substrate_preset == "nanopillars"`, the substrate is modeled as
+          circular gold pillars on a non-reflective background. The pillars are
+          treated as solid; the background is fluid. The function returns True
+          when the position lies inside a pillar and False otherwise.
+
     Future chip pattern models and substrate presets can extend this function
     in a backward-compatible way by adding additional geometry branches.
 
@@ -292,7 +417,7 @@ def is_position_in_chip_solid(params: dict, x_nm: float, y_nm: float) -> bool:
 
     Returns:
         bool: True if the position lies inside a solid region of the chip/
-        substrate (e.g., gold film), False otherwise.
+        substrate (e.g., gold film or pillars), False otherwise.
     """
     chip_enabled = bool(params.get("chip_pattern_enabled", False))
 
@@ -307,55 +432,69 @@ def is_position_in_chip_solid(params: dict, x_nm: float, y_nm: float) -> bool:
     if not chip_enabled or substrate_preset == "empty_background" or pattern_model == "none":
         return False
 
-    # Only gold-holes substrates are modeled as solid regions at this stage.
-    if pattern_model != "gold_holes_v1":
-        # For unimplemented pattern models we conservatively treat the domain
-        # as fluid everywhere so that enabling such a model does not silently
-        # introduce inconsistent dynamics.
-        return False
+    # Gold film with circular holes: solid region is outside the holes.
+    if pattern_model == "gold_holes_v1":
+        if substrate_preset not in ("default_gold_holes", "lab_default_gold_holes"):
+            # Unknown substrate preset for this pattern model; treat as no solid regions.
+            return False
 
-    if substrate_preset not in ("default_gold_holes", "lab_default_gold_holes"):
-        # Unknown substrate preset for this pattern model; treat as no solid
-        # regions for now. When additional substrate presets are implemented,
-        # they should be added explicitly here.
-        return False
+        geom = _resolve_gold_hole_parameters(params)
+        radius_um = geom["radius_um"]
+        pitch_um = geom["pitch_um"]
 
-    # Resolve geometry for the gold-hole lattice.
-    geom = _resolve_gold_hole_parameters(params)
-    radius_um = geom["radius_um"]
-    pitch_um = geom["pitch_um"]
+        _, _, r_um, _, _, _ = _map_position_nm_to_gold_hole_unit_cell(
+            params, x_nm, y_nm, pitch_um
+        )
 
-    # Map the position into the canonical unit cell and test whether it falls
-    # inside a hole or in the gold film.
-    _, _, r_um, _, _, _ = _map_position_nm_to_gold_hole_unit_cell(
-        params, x_nm, y_nm, pitch_um
-    )
+        inside_hole = (r_um <= radius_um)
+        # In this geometry, the gold film occupies all area outside the holes.
+        return not inside_hole
 
-    inside_hole = (r_um <= radius_um)
+    # Nanopillar array: solid region is inside the pillars.
+    if pattern_model == "nanopillars_v1":
+        if substrate_preset != "nanopillars":
+            return False
 
-    # In this geometry, the gold film occupies all area outside the holes.
-    # The particle cannot occupy space where gold is present, so any position
-    # outside a hole is considered "solid" from the perspective of Brownian
-    # motion.
-    return not inside_hole
+        geom = _resolve_nanopillar_parameters(params)
+        radius_um = geom["radius_um"]
+        pitch_um = geom["pitch_um"]
+
+        _, _, r_um, _, _, _ = _map_position_nm_to_gold_hole_unit_cell(
+            params, x_nm, y_nm, pitch_um
+        )
+
+        inside_pillar = (r_um <= radius_um)
+        return inside_pillar
+
+    # For unimplemented pattern models we conservatively treat the domain as
+    # fluid everywhere so that enabling such a model does not silently
+    # introduce inconsistent dynamics.
+    return False
 
 
 def project_position_to_fluid_region(params: dict, x_nm: float, y_nm: float) -> tuple:
     """
     Given a lateral position (x_nm, y_nm), project it into the nearest fluid
-    region of the chip (i.e., inside a hole) if it currently lies in a solid
-    (gold) region.
+    region of the chip (i.e., outside solid regions) if it currently lies in a
+    solid region.
 
     This function is used to correct Brownian steps that would otherwise place
     the particle center inside the solid chip/substrate. It preserves the
     underlying random step statistics (no resampling) by deterministically
-    mapping such positions back to the nearest point inside the hole, just
-    inside the gold/fluid boundary.
+    mapping such positions back to the nearest point inside the allowed fluid
+    region, just inside or outside the solid/fluid boundary as appropriate.
 
     Behavior is defined only for:
-        chip_pattern_enabled = True,
-        chip_pattern_model  = "gold_holes_v1",
-        chip_substrate_preset in {"default_gold_holes", "lab_default_gold_holes"}.
+        chip_pattern_enabled = True, and one of:
+            - chip_pattern_model  = "gold_holes_v1",
+              chip_substrate_preset in {"default_gold_holes", "lab_default_gold_holes"}:
+                solid = gold film outside holes; projection moves a point from
+                gold into the nearest point just inside a hole.
+
+            - chip_pattern_model  = "nanopillars_v1",
+              chip_substrate_preset == "nanopillars":
+                solid = circular pillars; projection moves a point from inside
+                a pillar to the nearest point just outside the pillar.
 
     For all other configurations, the input position is returned unchanged.
 
@@ -379,55 +518,94 @@ def project_position_to_fluid_region(params: dict, x_nm: float, y_nm: float) -> 
     substrate_preset_raw = params.get("chip_substrate_preset", "empty_background")
     substrate_preset = str(substrate_preset_raw).strip().lower()
 
-    if (
-        (not chip_enabled)
-        or pattern_model != "gold_holes_v1"
-        or substrate_preset not in ("default_gold_holes", "lab_default_gold_holes")
-    ):
+    if not chip_enabled:
         # Unsupported configuration for projection logic; leave position as-is.
         return float(x_nm), float(y_nm)
 
-    # Geometry parameters (same source as in is_position_in_chip_solid).
-    geom = _resolve_gold_hole_parameters(params)
-    radius_um = geom["radius_um"]
-    pitch_um = geom["pitch_um"]
+    # --- Gold film with circular holes: project from gold into a hole ---
+    if (
+        pattern_model == "gold_holes_v1"
+        and substrate_preset in ("default_gold_holes", "lab_default_gold_holes")
+    ):
+        geom = _resolve_gold_hole_parameters(params)
+        radius_um = geom["radius_um"]
+        pitch_um = geom["pitch_um"]
 
-    # Map position into the unit cell and obtain centered coordinates.
-    dx_um, dy_um, r_um, x_um, y_um, img_size_nm = _map_position_nm_to_gold_hole_unit_cell(
-        params, x_nm, y_nm, pitch_um
-    )
+        dx_um, dy_um, r_um, x_um, y_um, img_size_nm = _map_position_nm_to_gold_hole_unit_cell(
+            params, x_nm, y_nm, pitch_um
+        )
 
-    # If for some reason we are already in the hole (should not happen here),
-    # leave unchanged.
-    if r_um <= radius_um or r_um == 0.0:
-        return float(x_nm), float(y_nm)
+        # If for some reason we are already in the hole (should not happen here),
+        # leave unchanged.
+        if r_um <= radius_um or r_um == 0.0:
+            return float(x_nm), float(y_nm)
 
-    # Project radially from the current position in the unit cell to just
-    # inside the hole boundary.
-    # Use a small inward offset (1 nm) to avoid numerical ambiguity exactly
-    # on the boundary.
-    r_target_um = max(radius_um - 1e-3, 0.0)  # 1e-3 µm = 1 nm
-    scale = r_target_um / r_um if r_um > 0.0 else 0.0
+        # Project radially from the current position in the unit cell to just
+        # inside the hole boundary.
+        # Use a small inward offset (1 nm) to avoid numerical ambiguity exactly
+        # on the boundary.
+        r_target_um = max(radius_um - 1e-3, 0.0)  # 1e-3 µm = 1 nm
+        scale = r_target_um / r_um if r_um > 0.0 else 0.0
 
-    new_dx_um = dx_um * scale
-    new_dy_um = dy_um * scale
+        new_dx_um = dx_um * scale
+        new_dy_um = dy_um * scale
 
-    # Compute how much we moved within the unit cell.
-    delta_dx_um = new_dx_um - dx_um
-    delta_dy_um = new_dy_um - dy_um
+        # Compute how much we moved within the unit cell.
+        delta_dx_um = new_dx_um - dx_um
+        delta_dy_um = new_dy_um - dy_um
 
-    # Apply the same deltas in the global (centered) coordinates. This keeps
-    # the particle in the same lattice cell while pushing it into the hole.
-    new_x_um = x_um + delta_dx_um
-    new_y_um = y_um + delta_dy_um
+        # Apply the same deltas in the global (centered) coordinates. This keeps
+        # the particle in the same lattice cell while pushing it into the hole.
+        new_x_um = x_um + delta_dx_um
+        new_y_um = y_um + delta_dy_um
 
-    new_x_nm_centered = new_x_um * 1e3
-    new_y_nm_centered = new_y_um * 1e3
+        new_x_nm_centered = new_x_um * 1e3
+        new_y_nm_centered = new_y_um * 1e3
 
-    new_x_nm = new_x_nm_centered + img_size_nm / 2.0
-    new_y_nm = new_y_nm_centered + img_size_nm / 2.0
+        new_x_nm = new_x_nm_centered + img_size_nm / 2.0
+        new_y_nm = new_y_nm_centered + img_size_nm / 2.0
 
-    return float(new_x_nm), float(new_y_nm)
+        return float(new_x_nm), float(new_y_nm)
+
+    # --- Nanopillars: project from pillar interior into background fluid ---
+    if pattern_model == "nanopillars_v1" and substrate_preset == "nanopillars":
+        geom = _resolve_nanopillar_parameters(params)
+        radius_um = geom["radius_um"]
+        pitch_um = geom["pitch_um"]
+
+        dx_um, dy_um, r_um, x_um, y_um, img_size_nm = _map_position_nm_to_gold_hole_unit_cell(
+            params, x_nm, y_nm, pitch_um
+        )
+
+        # In this geometry, solid region is inside the pillar (r <= radius).
+        # We project radially outward to just outside the pillar boundary.
+        if r_um == 0.0:
+            # Extremely unlikely: exactly at pillar center. Choose a fixed
+            # direction along +x for the outward step.
+            new_dx_um = radius_um + 1e-3  # 1 nm outside the pillar radius
+            new_dy_um = 0.0
+        else:
+            r_target_um = radius_um + 1e-3  # 1 nm outside the pillar radius
+            scale = r_target_um / r_um
+            new_dx_um = dx_um * scale
+            new_dy_um = dy_um * scale
+
+        delta_dx_um = new_dx_um - dx_um
+        delta_dy_um = new_dy_um - dy_um
+
+        new_x_um = x_um + delta_dx_um
+        new_y_um = y_um + delta_dy_um
+
+        new_x_nm_centered = new_x_um * 1e3
+        new_y_nm_centered = new_y_um * 1e3
+
+        new_x_nm = new_x_nm_centered + img_size_nm / 2.0
+        new_y_nm = new_y_nm_centered + img_size_nm / 2.0
+
+        return float(new_x_nm), float(new_y_nm)
+
+    # Unsupported configuration for projection logic; leave position as-is.
+    return float(x_nm), float(y_nm)
 
 
 def generate_reference_and_background_maps(
@@ -441,8 +619,8 @@ def generate_reference_and_background_maps(
 
     This function centralizes the optical background / substrate model. It
     supports both a uniform background (no chip pattern) and parameterized chip
-    pattern presets such as a gold film with circular holes. The returned maps
-    are:
+    pattern presets such as a gold film with circular holes or a nanopillar
+    array. The returned maps are:
 
         - E_ref_os: complex reference field on the oversampled field of view.
         - E_ref_final: complex reference field at the final image resolution.
@@ -465,7 +643,8 @@ def generate_reference_and_background_maps(
           spatially uniform as in the original implementation.
         - Otherwise, the pattern model and substrate preset determine the
           spatial maps. Currently, "gold_holes_v1" with presets
-          "default_gold_holes" and "lab_default_gold_holes" are supported.
+          "default_gold_holes" and "lab_default_gold_holes", and
+          "nanopillars_v1" with preset "nanopillars" are supported.
 
     Note:
         This function is intentionally time-independent. Any temporal evolution
@@ -503,32 +682,6 @@ def generate_reference_and_background_maps(
 
         return E_ref_os, E_ref_final, background_final
 
-    # At this point, a chip pattern is requested. We validate and construct the
-    # appropriate pattern maps.
-    if pattern_model != "gold_holes_v1":
-        raise ValueError(
-            f"Unsupported chip_pattern_model '{pattern_model_raw}'. "
-            "Currently supported: 'none', 'gold_holes_v1'."
-        )
-
-    # Only gold-hole presets are implemented at this stage. This can be extended
-    # to additional substrates (e.g., nanopillars) later without changing the
-    # interface of this function.
-    if substrate_preset not in ("default_gold_holes", "lab_default_gold_holes"):
-        raise ValueError(
-            f"Unsupported chip_substrate_preset '{substrate_preset_raw}' for "
-            "chip_pattern_model 'gold_holes_v1'. Supported presets are "
-            "'empty_background', 'default_gold_holes', and 'lab_default_gold_holes'."
-        )
-
-    # Resolve geometry and intensity parameters from PARAMS in a single place.
-    geom = _resolve_gold_hole_parameters(params)
-    hole_diameter_um = geom["hole_diameter_um"]
-    hole_edge_to_edge_spacing_um = geom["hole_edge_to_edge_spacing_um"]
-    hole_depth_nm = geom["hole_depth_nm"]  # currently unused in optics
-    hole_intensity_factor = geom["hole_intensity_factor"]
-    gold_intensity_factor = geom["gold_intensity_factor"]
-
     pixel_size_nm = float(params["pixel_size_nm"])
     if pixel_size_nm <= 0.0:
         raise ValueError("PARAMS['pixel_size_nm'] must be positive.")
@@ -537,26 +690,79 @@ def generate_reference_and_background_maps(
     if os_factor <= 0.0:
         raise ValueError("PARAMS['psf_oversampling_factor'] must be positive.")
 
-    # Generate pattern maps at both resolutions:
-    #   - pattern_final: at the final image resolution, using the nominal pixel size.
-    #   - pattern_os: at the oversampled resolution, with a smaller effective pixel size.
-    pattern_final = _generate_gold_hole_pattern(
-        shape=final_fov_shape,
-        pixel_size_nm=pixel_size_nm,
-        hole_diameter_um=hole_diameter_um,
-        hole_edge_to_edge_spacing_um=hole_edge_to_edge_spacing_um,
-        hole_intensity_factor=hole_intensity_factor,
-        gold_intensity_factor=gold_intensity_factor,
-    )
+    # At this point, a chip pattern is requested. We validate and construct the
+    # appropriate pattern maps based on the selected model and substrate preset.
+    if pattern_model == "gold_holes_v1":
+        if substrate_preset not in ("default_gold_holes", "lab_default_gold_holes"):
+            raise ValueError(
+                f"Unsupported chip_substrate_preset '{substrate_preset_raw}' for "
+                "chip_pattern_model 'gold_holes_v1'. Supported presets are "
+                "'empty_background', 'default_gold_holes', and 'lab_default_gold_holes'."
+            )
 
-    pattern_os = _generate_gold_hole_pattern(
-        shape=fov_shape_os,
-        pixel_size_nm=pixel_size_nm / os_factor,
-        hole_diameter_um=hole_diameter_um,
-        hole_edge_to_edge_spacing_um=hole_edge_to_edge_spacing_um,
-        hole_intensity_factor=hole_intensity_factor,
-        gold_intensity_factor=gold_intensity_factor,
-    )
+        geom = _resolve_gold_hole_parameters(params)
+        hole_diameter_um = geom["hole_diameter_um"]
+        hole_edge_to_edge_spacing_um = geom["hole_edge_to_edge_spacing_um"]
+        hole_depth_nm = geom["hole_depth_nm"]  # currently unused in optics
+        hole_intensity_factor = geom["hole_intensity_factor"]
+        gold_intensity_factor = geom["gold_intensity_factor"]
+
+        pattern_final = _generate_gold_hole_pattern(
+            shape=final_fov_shape,
+            pixel_size_nm=pixel_size_nm,
+            hole_diameter_um=hole_diameter_um,
+            hole_edge_to_edge_spacing_um=hole_edge_to_edge_spacing_um,
+            hole_intensity_factor=hole_intensity_factor,
+            gold_intensity_factor=gold_intensity_factor,
+        )
+
+        pattern_os = _generate_gold_hole_pattern(
+            shape=fov_shape_os,
+            pixel_size_nm=pixel_size_nm / os_factor,
+            hole_diameter_um=hole_diameter_um,
+            hole_edge_to_edge_spacing_um=hole_edge_to_edge_spacing_um,
+            hole_intensity_factor=hole_intensity_factor,
+            gold_intensity_factor=gold_intensity_factor,
+        )
+
+    elif pattern_model == "nanopillars_v1":
+        if substrate_preset != "nanopillars":
+            raise ValueError(
+                f"Unsupported chip_substrate_preset '{substrate_preset_raw}' for "
+                "chip_pattern_model 'nanopillars_v1'. Supported presets are "
+                "'empty_background' and 'nanopillars'."
+            )
+
+        geom = _resolve_nanopillar_parameters(params)
+        pillar_diameter_um = geom["pillar_diameter_um"]
+        pillar_edge_to_edge_spacing_um = geom["pillar_edge_to_edge_spacing_um"]
+        pillar_height_nm = geom["pillar_height_nm"]  # currently unused in optics
+        pillar_intensity_factor = geom["pillar_intensity_factor"]
+        background_intensity_factor = geom["background_intensity_factor"]
+
+        pattern_final = _generate_nanopillar_pattern(
+            shape=final_fov_shape,
+            pixel_size_nm=pixel_size_nm,
+            pillar_diameter_um=pillar_diameter_um,
+            pillar_edge_to_edge_spacing_um=pillar_edge_to_edge_spacing_um,
+            pillar_intensity_factor=pillar_intensity_factor,
+            background_intensity_factor=background_intensity_factor,
+        )
+
+        pattern_os = _generate_nanopillar_pattern(
+            shape=fov_shape_os,
+            pixel_size_nm=pixel_size_nm / os_factor,
+            pillar_diameter_um=pillar_diameter_um,
+            pillar_edge_to_edge_spacing_um=pillar_edge_to_edge_spacing_um,
+            pillar_intensity_factor=pillar_intensity_factor,
+            background_intensity_factor=background_intensity_factor,
+        )
+
+    else:
+        raise ValueError(
+            f"Unsupported chip_pattern_model '{pattern_model_raw}'. "
+            "Currently supported models are 'none', 'gold_holes_v1', and 'nanopillars_v1'."
+        )
 
     # Construct reference field maps by modulating the amplitude with the square
     # root of the pattern maps. This ensures that the local reference

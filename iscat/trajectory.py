@@ -36,9 +36,9 @@ def simulate_trajectories(params):
 
     Lateral (x, y) chip/substrate exclusion
     ---------------------------------------
-    When the chip pattern configuration indicates a gold film with circular
-    holes, lateral positions whose projection lies in the gold film are not
-    allowed. The behavior is:
+    When the chip pattern configuration indicates a solid pattern, lateral
+    positions whose projection lies in the solid region are not allowed. The
+    behavior is:
 
         - When PARAMS["chip_pattern_enabled"] is False, or
           PARAMS["chip_substrate_preset"] == "empty_background", or
@@ -52,6 +52,14 @@ def simulate_trajectories(params):
           back into the nearest fluid region (a hole) after each Brownian step
           using project_position_to_fluid_region. This enforces excluded volume
           without resampling steps.
+
+        - When a nanopillar array is enabled via
+          chip_pattern_model == "nanopillars_v1" and
+          chip_substrate_preset == "nanopillars", lateral positions whose
+          projection lies inside a nanopillar are deterministically mapped
+          back into the nearest fluid region just outside the pillar boundary,
+          again using project_position_to_fluid_region. This enforces excluded
+          volume without introducing trapping or non-random motion.
 
     Z-axis motion constraint model
     ------------------------------
@@ -131,10 +139,15 @@ def simulate_trajectories(params):
     substrate_preset_raw = params.get("chip_substrate_preset", "empty_background")
     substrate_preset = str(substrate_preset_raw).strip().lower()
 
-    apply_substrate_exclusion = (
-        chip_enabled
-        and pattern_model == "gold_holes_v1"
-        and substrate_preset in ("default_gold_holes", "lab_default_gold_holes")
+    apply_substrate_exclusion = chip_enabled and (
+        (
+            pattern_model == "gold_holes_v1"
+            and substrate_preset in ("default_gold_holes", "lab_default_gold_holes")
+        )
+        or (
+            pattern_model == "nanopillars_v1"
+            and substrate_preset == "nanopillars"
+        )
     )
 
     # Field-of-view extents used for sampling initial positions. These are
@@ -197,7 +210,7 @@ def simulate_trajectories(params):
             if apply_substrate_exclusion:
                 # Sample x, y until we find a position outside any solid region.
                 # This implements free Brownian initial positions conditioned on
-                # starting in the fluid region (holes).
+                # starting in the fluid region (holes or background between pillars).
                 max_attempts = 1000
                 for _ in range(max_attempts):
                     x_nm = float(np.random.rand() * img_size_nm)
