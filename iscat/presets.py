@@ -1,4 +1,3 @@
-# File: presets.py
 from copy import deepcopy
 from typing import Any, Callable, Dict, Iterable, Optional
 
@@ -102,6 +101,74 @@ INSTRUMENT_PRESETS: Dict[str, Dict[str, Any]] = {
 }
 
 
+# Aliases for user-facing instrument preset names.
+# Each alias maps to a canonical key in INSTRUMENT_PRESETS. This decouples
+# external naming (CLI flags, UI labels, etc.) from the internal dictionary
+# keys and avoids fragile assumptions about case or exact spelling.
+INSTRUMENT_PRESET_ALIASES: Dict[str, Iterable[str]] = {
+    "60x_nikon": (
+        "60x_nikon",
+        "60X_NIKON",
+        "60x nikon",
+        "nikon_60x",
+        "Nikon 60x",
+    ),
+    "100x_custom": (
+        "100x_custom",
+        "100X_CUSTOM",
+        "100x custom",
+        "custom_100x",
+        "Custom 100x",
+    ),
+}
+
+
+# Build a mapping from lowercase alias to canonical instrument preset key.
+_INSTRUMENT_PRESET_NAME_MAP: Dict[str, str] = {}
+for canonical, aliases in INSTRUMENT_PRESET_ALIASES.items():
+    for alias in aliases:
+        _INSTRUMENT_PRESET_NAME_MAP[alias.strip().lower()] = canonical
+    # Ensure the canonical key itself is always accepted.
+    _INSTRUMENT_PRESET_NAME_MAP[canonical.strip().lower()] = canonical
+
+
+def _normalize_instrument_preset_name(preset_name: str) -> str:
+    """
+    Normalize a user-provided instrument preset name to a canonical key.
+
+    This function centralizes all name handling for instrument presets so that
+    public APIs (apply_instrument_preset, create_params_for_instrument, CLI
+    wrappers, etc.) can accept flexible human-facing labels without depending
+    on fragile, exact-string matches.
+
+    Args:
+        preset_name (str): User-provided preset name (case-insensitive, may
+            include spaces or different separators for known aliases).
+
+    Returns:
+        str: Canonical instrument preset key used in INSTRUMENT_PRESETS.
+
+    Raises:
+        ValueError: If the preset name is not recognized.
+    """
+    key = preset_name.strip().lower()
+    if key in _INSTRUMENT_PRESET_NAME_MAP:
+        canonical = _INSTRUMENT_PRESET_NAME_MAP[key]
+        # As a safety check, ensure the canonical key actually exists.
+        if canonical not in INSTRUMENT_PRESETS:
+            raise ValueError(
+                f"Internal preset alias map refers to unknown instrument preset "
+                f"'{canonical}'. Available presets: {sorted(INSTRUMENT_PRESETS.keys())}"
+            )
+        return canonical
+
+    available = ", ".join(sorted(INSTRUMENT_PRESETS.keys()))
+    raise ValueError(
+        f"Unknown instrument preset '{preset_name}'. "
+        f"Available instrument presets: {available}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Instrument preset public API
 # ---------------------------------------------------------------------------
@@ -131,6 +198,13 @@ def apply_instrument_preset(base_params: Dict[str, Any], preset_name: str) -> Di
     The base parameter dictionary is typically a copy of config.PARAMS, but it
     can be any dictionary that follows the same structure.
 
+    Name handling:
+        - The user-supplied `preset_name` is normalized via
+          `_normalize_instrument_preset_name`, which accepts common aliases
+          (e.g., "60x nikon", "Nikon 60x") in addition to the canonical keys
+          ("60x_nikon", "100x_custom"). This prevents fragile dependence on
+          exact string matching.
+
     Args:
         base_params (Dict[str, Any]):
             The starting parameter dictionary to which the preset will be
@@ -138,26 +212,22 @@ def apply_instrument_preset(base_params: Dict[str, Any], preset_name: str) -> Di
         preset_name (str):
             Name of the instrument preset to apply. Matching is
             case-insensitive and leading/trailing whitespace is ignored.
-            Valid names can be obtained from get_instrument_preset_names().
+            Valid names can be obtained from get_instrument_preset_names()
+            (canonical keys) or from documentation of the accepted aliases.
 
     Returns:
         Dict[str, Any]: A new parameter dictionary with the instrument preset
         applied.
 
     Raises:
+        TypeError: If `base_params` is not a dictionary.
         ValueError: If `preset_name` does not correspond to a known instrument
         preset.
     """
     if not isinstance(base_params, dict):
         raise TypeError("base_params must be a dictionary.")
 
-    canonical = preset_name.strip().lower()
-    if canonical not in INSTRUMENT_PRESETS:
-        available = ", ".join(sorted(INSTRUMENT_PRESETS.keys()))
-        raise ValueError(
-            f"Unknown instrument preset '{preset_name}'. "
-            f"Available instrument presets: {available}"
-        )
+    canonical = _normalize_instrument_preset_name(preset_name)
 
     params_copy = deepcopy(base_params)
     overrides = INSTRUMENT_PRESETS[canonical]
@@ -186,7 +256,8 @@ def create_params_for_instrument(preset_name: str) -> Dict[str, Any]:
 
     Args:
         preset_name (str): Name of the instrument preset to apply. See
-            get_instrument_preset_names() for available options.
+            get_instrument_preset_names() for canonical options; common
+            aliases are also accepted (e.g., "60x nikon", "Nikon 60x").
 
     Returns:
         Dict[str, Any]: A new parameter dictionary configured for the specified
@@ -369,6 +440,7 @@ def apply_experiment_preset(
         realization of the requested experiment.
 
     Raises:
+        TypeError: If base_params is not a dictionary.
         ValueError: If `experiment_name` does not correspond to a known
         experiment preset.
     """
