@@ -190,16 +190,14 @@ PARAMS = {
     #             Particle is modeled as a rigid composite shape whose
     #             geometry is defined in composite_shape_library[name].
     #
-    # In this default PARAMS, we omit this key so that behavior remains purely
-    # spherical. Composite shapes can be enabled by presets or advanced users
-    # by adding a "particle_shape_models" entry.
-    #
-    # Example (not active by default):
-    #   "particle_shape_models": ["spherical", "h2o_like"],
-    #
-    # which would treat particle 0 as spherical and particle 1 as a composite
-    # whose geometry is defined in composite_shape_library["h2o_like"].
-    # "particle_shape_models": [...],
+    # In this default PARAMS, we treat the first particle as spherical and
+    # the second particle as a simple three-sub-particle composite ("h2o_like").
+    # The composite shape reuses the parent particle's optical type so that no
+    # additional iPSF stacks are required.
+    "particle_shape_models": [
+        "spherical",   # particle 0: simple sphere
+        "h2o_like",    # particle 1: rigid composite defined below
+    ],
 
     # Library of named composite particle geometries.
     #
@@ -231,44 +229,49 @@ PARAMS = {
     #   - diameter_nm, refractive_index:
     #       Optional overrides for the sub-particle's optical type. When
     #       either is set to None, the parent particle's diameter and/or
-    #       refractive index are used. In the current structural step we
-    #       enforce that any resulting (diameter, n.real, n.imag) combination
-    #       must already exist among the base particle types so that the
-    #       necessary iPSF stacks have been computed.
+    #       refractive index are used. In this configuration, we enforce that
+    #       any resulting (diameter, n.real, n.imag) combination matches an
+    #       existing base particle type so that the necessary iPSF stacks have
+    #       already been computed.
     #
     #   - signal_multiplier:
     #       Optional local amplitude multiplier applied on top of the parent
     #       ParticleInstance.signal_multiplier for this sub-particle only.
     #       Defaults to 1.0 when omitted.
     #
-    # The default library is empty so that no composites are active unless a
-    # preset or user explicitly adds entries and references them via
-    # particle_shape_models.
+    # The default library below defines a single simple composite shape
+    # ("h2o_like") with three sub-particles: one central and two at symmetric
+    # offsets in the x–y plane. All sub-particles inherit the parent particle's
+    # diameter and refractive index, so no additional iPSF types are required.
     "composite_shape_library": {
-        # Example skeleton (NOT active; left as documentation only):
-        #
-        # "h2o_like": {
-        #     "sub_particles": [
-        #         {
-        #             "offset_nm": [0.0, 0.0, 0.0],
-        #             "diameter_nm": None,          # inherit parent diameter
-        #             "refractive_index": None,     # inherit parent n
-        #             "signal_multiplier": 1.0,
-        #         },
-        #         {
-        #             "offset_nm": [50.0, 0.0, 0.0],
-        #             "diameter_nm": None,
-        #             "refractive_index": None,
-        #             "signal_multiplier": 1.0,
-        #         },
-        #         {
-        #             "offset_nm": [-50.0, 0.0, 0.0],
-        #             "diameter_nm": None,
-        #             "refractive_index": None,
-        #             "signal_multiplier": 1.0,
-        #         },
-        #     ],
-        # },
+        "h2o_like": {
+            "sub_particles": [
+                {
+                    # Central sub-particle at the composite center.
+                    "offset_nm": [0.0, 0.0, 0.0],
+                    "diameter_nm": None,          # inherit parent diameter
+                    "refractive_index": None,     # inherit parent n
+                    "signal_multiplier": 1.0,
+                },
+                {
+                    # First "arm" offset; magnitude ~50 nm in-plane.
+                    "offset_nm": [50.0, 0.0, 0.0],
+                    "diameter_nm": None,
+                    "refractive_index": None,
+                    "signal_multiplier": 1.0,
+                },
+                {
+                    # Second "arm" offset; symmetric around the x-axis.
+                    # Here we choose an angle of ~125 degrees between arms
+                    # conceptually, but keep the actual offset simple in this
+                    # minimal configuration while still clearly non-spherical.
+                    "offset_nm": [-50.0, 0.0, 0.0],
+                    "diameter_nm": None,
+                    "refractive_index": None,
+                    "signal_multiplier": 1.0,
+                },
+            ],
+        },
     },
 
     # --- BROWNIAN MOTION ---
@@ -314,7 +317,8 @@ PARAMS = {
     # These settings control simulate_orientations (trajectory.py). In the
     # current default configuration rotational diffusion is disabled, so
     # orientation_matrices is None for all particles and the renderer behaves
-    # identically to the original spherical-only implementation.
+    # identically to the original spherical-only implementation, except that
+    # composite shapes are rigid (fixed orientation).
     #
     #   "rotational_diffusion_enabled":
     #       When False (default), no orientations are simulated and all
