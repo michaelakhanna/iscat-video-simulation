@@ -63,14 +63,16 @@ def simulate_trajectories(params):
 
     Z-axis motion constraint model
     ------------------------------
-    The Z-axis behavior is controlled by PARAMS["z_motion_constraint_model"]:
+    The Z-axis behavior is controlled by PARAMS["z_motion_constraint_model"].
+
+    Supported values and their semantics:
 
         - "unconstrained":
             Fully free 3D Brownian motion in z. The z-coordinate executes a
             standard random walk with no boundaries. This corresponds to the
-            behavior that previously existed.
+            original behavior without any surface interaction.
 
-        - "surface_interaction_v1":
+        - "reflective_boundary_v1":
             Brownian motion in the half-space z >= 0 nm with a perfectly
             reflecting planar boundary at z = 0 nm. The interpretation is that
             z = 0 represents the chip/substrate surface, and the particle
@@ -84,10 +86,16 @@ def simulate_trajectories(params):
             provided, and user-specified initial positions must satisfy
             z >= 0 nm.
 
+        - "surface_interaction_v1" (alias for "reflective_boundary_v1"):
+            For backward compatibility with earlier configurations, the legacy
+            name "surface_interaction_v1" is accepted and mapped internally
+            to the same behavior as "reflective_boundary_v1". No physical
+            difference exists between these two options.
+
         - "surface_interaction_v2":
             Brownian motion in the half-space z <= 0 nm with a perfectly
             reflecting planar boundary at z = 0 nm. This is the mirror image
-            of surface_interaction_v1: the particle center lives below the
+            of "reflective_boundary_v1": the particle center lives below the
             plane and cannot cross into z > 0. Any Brownian step that would
             place the particle at z > 0 is reflected across the plane.
 
@@ -120,13 +128,23 @@ def simulate_trajectories(params):
 
     # --- Z-motion constraint model selection and validation ---
     z_model_raw = params.get("z_motion_constraint_model", "unconstrained")
-    z_model = str(z_model_raw).strip().lower()
+    z_model_key = str(z_model_raw).strip().lower()
 
-    if z_model not in ("unconstrained", "surface_interaction_v1", "surface_interaction_v2"):
+    # Map legacy names and canonical names to a small set of internal modes.
+    if z_model_key == "unconstrained":
+        z_model = "unconstrained"
+    elif z_model_key in ("reflective_boundary_v1", "surface_interaction_v1"):
+        # Canonical reflective boundary at z = 0 with z >= 0 half-space.
+        z_model = "reflective_boundary_v1"
+    elif z_model_key == "surface_interaction_v2":
+        # Mirror of reflective_boundary_v1: z <= 0 half-space.
+        z_model = "surface_interaction_v2"
+    else:
         raise ValueError(
             f"Unsupported z_motion_constraint_model '{z_model_raw}'. "
             "Currently supported values are 'unconstrained', "
-            "'surface_interaction_v1', and 'surface_interaction_v2'."
+            "'reflective_boundary_v1', 'surface_interaction_v1' (alias), "
+            "and 'surface_interaction_v2'."
         )
 
     # --- Chip/substrate exclusion model selection (lateral) ---
@@ -167,7 +185,7 @@ def simulate_trajectories(params):
             )
 
         # Validate user-provided initial positions against the chip/substrate
-        # exclusion (x, y) and the Z-surface model for surface_interaction_v1/v2.
+        # exclusion (x, y) and the Z-surface model.
         for i in range(num_particles):
             x_nm = float(initial_positions[i, 0])
             y_nm = float(initial_positions[i, 1])
@@ -182,13 +200,13 @@ def simulate_trajectories(params):
                     "when substrate exclusion is active."
                 )
 
-            if z_model == "surface_interaction_v1" and z_nm < 0.0:
+            if z_model == "reflective_boundary_v1" and z_nm < 0.0:
                 raise ValueError(
                     "PARAMS['particle_initial_positions_nm'] entry "
                     f"for particle index {i} has z = {z_nm} nm, which is below the "
                     "surface plane z = 0 nm for z_motion_constraint_model "
-                    "=='surface_interaction_v1'. Initial z-positions for this model "
-                    "must satisfy z >= 0 nm."
+                    "=='reflective_boundary_v1' (or its alias 'surface_interaction_v1'). "
+                    "Initial z-positions for this model must satisfy z >= 0 nm."
                 )
 
             if z_model == "surface_interaction_v2" and z_nm > 0.0:
@@ -233,14 +251,19 @@ def simulate_trajectories(params):
                 # Symmetric distribution around z = 0, spanning the full Z-stack
                 # range as before.
                 initial_positions[i, 2] = (float(np.random.rand()) - 0.5) * z_range_nm
-            elif z_model == "surface_interaction_v1":
+            elif z_model == "reflective_boundary_v1":
                 # Start in the half-space z >= 0. For simplicity and consistency
                 # with the iPSF stack, sample z uniformly from [0, z_range_nm / 2).
                 initial_positions[i, 2] = float(np.random.rand()) * (z_range_nm / 2.0)
             elif z_model == "surface_interaction_v2":
-                # Start in the half-space z <= 0. Mirror of surface_interaction_v1:
+                # Start in the half-space z <= 0. Mirror of reflective_boundary_v1:
                 # sample z uniformly from [-z_range_nm / 2, 0].
                 initial_positions[i, 2] = -float(np.random.rand()) * (z_range_nm / 2.0)
+            else:
+                # This should not be reachable due to earlier validation.
+                raise RuntimeError(
+                    f"Unexpected z_motion_constraint_model '{z_model_raw}' encountered during initialization."
+                )
 
     # --- Allocate trajectory array and set initial positions ---
     trajectories = np.zeros((num_particles, num_frames, 3), dtype=float)
@@ -298,7 +321,7 @@ def simulate_trajectories(params):
 
             if z_model == "unconstrained":
                 z_nm_new = prev_z_nm + dz_nm
-            elif z_model == "surface_interaction_v1":
+            elif z_model == "reflective_boundary_v1":
                 # Reflective boundary at z = 0 nm. If the proposed step would
                 # cross into z < 0, reflect it across the plane so the particle
                 # remains in the half-space z >= 0.

@@ -160,7 +160,7 @@ PARAMS = {
     # If provided, must be an array-like of shape (num_particles, 3),
     # giving [x, y, z] for each particle. If omitted or None, positions are
     # initialized uniformly over the field of view (x, y) and within the
-    # z_stack_range_nm (z).
+    # z_stack_range_nm (z), subject to the chosen z-motion constraint model.
     # "particle_initial_positions_nm": [[x1, y1, z1], [x2, y2, z2], ...],
 
     # --- BROWNIAN MOTION ---
@@ -176,7 +176,30 @@ PARAMS = {
     # Model controlling the Z-axis Brownian motion (and, in future, interactions
     # with surfaces or substrates).
     #
-    "z_motion_constraint_model": "surface_interaction_v1",
+    # Supported options:
+    #   "unconstrained":
+    #       Fully free 3D Brownian motion in z with no boundaries. The z
+    #       coordinate executes a standard random walk.
+    #
+    #   "reflective_boundary_v1":
+    #       Brownian motion in the half-space z >= 0 nm with a perfectly
+    #       reflecting planar boundary at z = 0 nm. The particle center is
+    #       prevented from entering z < 0 by reflecting any step that would
+    #       cross the plane. This matches the "reflective boundary at z = 0"
+    #       model in the Code Design Document.
+    #
+    #   "surface_interaction_v1":
+    #       Legacy alias for "reflective_boundary_v1". Accepted for backward
+    #       compatibility; internally mapped to the same behavior.
+    #
+    #   "surface_interaction_v2":
+    #       Mirror of "reflective_boundary_v1": Brownian motion in the
+    #       half-space z <= 0 nm with a reflecting boundary at z = 0 nm. The
+    #       particle center is prevented from entering z > 0 by reflection.
+    #       This variant is not explicitly described in the CDD but is kept
+    #       available for experiments that require a lower-half-space model.
+    #
+    "z_motion_constraint_model": "reflective_boundary_v1",
 
     # --- iPSF & SCATTERING CALCULATION ---
     # Oversampling factor for the internal PSF/canvas resolution.
