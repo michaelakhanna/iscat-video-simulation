@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 
@@ -9,29 +9,67 @@ from optics import IPSFZInterpolator
 
 
 @dataclass(frozen=True)
+class SubParticle:
+    """
+    Describes a spherical sub-particle within a (potentially non-spherical)
+    composite particle shape.
+
+    Geometry:
+        - offset_nm: 3D vector giving the body-fixed position of this
+          sub-particle relative to the composite's reference point, in nm.
+
+    Optics:
+        - diameter_nm: physical diameter of the sub-particle, in nm.
+        - refractive_index: complex refractive index (n + i k).
+        - ipsf_interpolator: spherical iPSF interpolator for this
+          sub-particle type.
+        - signal_multiplier: local amplitude scaling applied on top of the
+          parent ParticleInstance.signal_multiplier.
+    """
+    offset_nm: np.ndarray
+    diameter_nm: float
+    refractive_index: complex
+    ipsf_interpolator: IPSFZInterpolator
+    signal_multiplier: float = 1.0
+
+
+@dataclass(frozen=True)
 class ParticleType:
     """
     Describes an optical "particle type" in the simulation.
 
-    In the current implementation, a particle type corresponds to a single
-    spherical particle characterized by:
-        - Its physical diameter in nanometers.
-        - Its complex refractive index (n + i k).
-        - A precomputed iPSF Z-interpolator defined on a type-specific z-grid.
+    In the current (spherical) implementation a particle type corresponds to
+    a single spherical particle characterized by:
+        - diameter_nm: physical diameter in nanometers.
+        - refractive_index: complex refractive index (n + i k).
+        - ipsf_interpolator: spherical iPSF Z-interpolator defined on a
+          type-specific z-grid.
 
-    Multiple particle instances that share the same (diameter, refractive index)
-    pair reference the same ParticleType object and therefore share the same
-    iPSF Z-stack and interpolator. This deduplication logic already existed in
-    main.run_simulation; this class makes it explicit and extensible.
+    To prepare for non-spherical particles modeled as rigid clusters of
+    spherical sub-particles (CDD Sections 2.3, 3.2, 3.3), this class also
+    carries:
 
-    Future extensions (non-spherical / composite particles) can add additional
-    fields here (e.g., rigid sub-particle geometry, shape kind), but from the
-    perspective of the current spherical pipeline, those extensions will be
-    additive and will not change behavior.
+        - is_composite:
+            False -> the particle is treated as a single sphere; the renderer
+                     uses ipsf_interpolator directly (current behavior).
+            True  -> the particle is a rigid composite; the renderer ignores
+                     ipsf_interpolator and instead loops over sub_particles.
+
+        - sub_particles:
+            Tuple of SubParticle objects describing the rigid internal
+            geometry in a body-fixed frame. For spherical particles this
+            tuple is empty (is_composite=False). For future non-spherical
+            particles it will list all sub-spheres.
+
+    Current code only constructs spherical ParticleType instances with
+    is_composite=False and sub_particles=().
     """
     diameter_nm: float
     refractive_index: complex
     ipsf_interpolator: IPSFZInterpolator
+
+    is_composite: bool = False
+    sub_particles: Tuple[SubParticle, ...] = ()
 
     @property
     def type_key(self) -> Tuple[float, float, float]:
@@ -54,21 +92,29 @@ class ParticleInstance:
     Represents a single particle instance in the simulation.
 
     Each instance:
-        - References exactly one ParticleType (which defines its optical
-          behavior and iPSF interpolator).
+        - References exactly one ParticleType (optical behavior and iPSF).
         - Stores its full 3D trajectory in nanometers over all frames.
         - Stores its per-particle signal multiplier (scalar amplitude factor).
+        - Optionally stores a per-frame orientation for non-spherical
+          composite particles.
 
-    This is a purely structural abstraction for now: the rest of the code
-    still uses the legacy arrays (trajectories_nm and ipsf_interpolators)
-    to render the video. Subsequent refactors can switch rendering and
-    trackability logic over to using ParticleInstance directly without
-    changing how trajectories or iPSF stacks are produced.
+    Orientation representation:
+        - orientation_matrices is either:
+            * None (for spherical particles, current code),
+            * or a numpy array of shape (num_frames, 3, 3) where each 3x3
+              matrix is a rotation mapping body-fixed coordinates into the
+              lab/world frame at that frame index.
+
+        - In this structural refactor, orientation_matrices is always None,
+          and the renderer ignores orientation for all particles. This keeps
+          behavior identical to the previous spherical-only implementation
+          while preparing the interface for rotational Brownian motion.
     """
     index: int
     particle_type: ParticleType
     trajectory_nm: np.ndarray
     signal_multiplier: float
+    orientation_matrices: Optional[np.ndarray] = None
 
 
 def build_particle_types_and_instances(
@@ -87,8 +133,9 @@ def build_particle_types_and_instances(
     were computed in main.run_simulation.
 
     It does not change any behavior of the simulation; the returned objects
-    are an additional representation that can be adopted by downstream
-    components (e.g., rendering) in future refactors.
+    are an additional representation that downstream components (e.g.,
+    rendering) now consume. The numerical results of the simulation remain
+    governed by the same trajectories and iPSF stacks as before.
 
     Args:
         params (dict):
@@ -144,6 +191,8 @@ def build_particle_types_and_instances(
         )
 
     # Build ParticleType objects from the provided per-type interpolators.
+    # At this stage all types are spherical: is_composite=False and
+    # sub_particles=().
     particle_types: Dict[Tuple[float, float, float], ParticleType] = {}
     for type_key, interpolator in ipsf_interpolators_by_type.items():
         diam_nm, n_real, n_imag = type_key
@@ -152,10 +201,14 @@ def build_particle_types_and_instances(
             diameter_nm=float(diam_nm),
             refractive_index=n_complex,
             ipsf_interpolator=interpolator,
+            is_composite=False,
+            sub_particles=(),
         )
 
     # Build ParticleInstance objects, one per particle, referencing the
-    # appropriate ParticleType and its trajectory.
+    # appropriate ParticleType and its trajectory. orientation_matrices is
+    # left as None for all particles; rotational dynamics will use this
+    # field in future extensions.
     instances: List[ParticleInstance] = []
     for i in range(num_particles):
         n_complex = particle_refractive_indices[i]
@@ -180,6 +233,7 @@ def build_particle_types_and_instances(
             particle_type=ptype,
             trajectory_nm=trajectories_nm[i],
             signal_multiplier=float(signal_multipliers[i]),
+            orientation_matrices=None,
         )
         instances.append(instance)
 

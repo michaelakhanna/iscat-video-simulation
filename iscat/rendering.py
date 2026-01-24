@@ -6,7 +6,7 @@ from scipy.special import j1
 from mask_generation import generate_and_save_mask_for_particle
 from trackability import TrackabilityModel
 from chip_pattern import generate_reference_and_background_maps, compute_contrast_scale_for_frame
-from particle_model import ParticleInstance
+from particle_model import ParticleInstance, ParticleType, SubParticle
 
 
 def add_noise(frame, params):
@@ -177,6 +177,72 @@ def _accumulate_psf_on_canvas(canvas, psf, center_x, center_y):
     canvas[y0_c:y1_c, x0_c:x1_c] += psf[ky0:ky1, kx0:kx1]
 
 
+def _iter_subparticle_render_info(
+    instance: ParticleInstance,
+    base_position_nm: np.ndarray,
+) -> list[tuple[np.ndarray, object, float]]:
+    """
+    Compute the list of sub-particle render instructions for a given particle
+    instance at a given (possibly interpolated) position.
+
+    Each returned tuple has the form:
+        (world_position_nm, ipsf_interpolator, local_signal_multiplier)
+
+    where:
+        - world_position_nm: 3D coordinates [x, y, z] in nm for this sub-particle.
+        - ipsf_interpolator: spherical IPSFZInterpolator to use for this sub-particle.
+        - local_signal_multiplier: multiplicative factor applied to the
+          scattered field from this sub-particle, on top of the parent
+          ParticleInstance.signal_multiplier.
+
+    Current behavior (spherical-only):
+        - For all particles, is_composite is False and sub_particles is empty.
+        - This helper therefore returns a single entry corresponding to the
+          particle's own iPSF at base_position_nm with local_signal_multiplier=1.0.
+
+    Future non-spherical behavior:
+        - When instance.particle_type.is_composite == True, this function will:
+            * Retrieve the per-frame rotation matrix from
+              instance.orientation_matrices.
+            * Rotate each SubParticle.offset_nm into world coordinates.
+            * Add base_position_nm to obtain each sub-particle's world position.
+            * Use each sub-particle's ipsf_interpolator and signal_multiplier.
+    """
+    ptype: ParticleType = instance.particle_type
+
+    # Spherical case: no internal geometry; treat the whole particle as one
+    # sub-particle at the base_position_nm using the type-level interpolator.
+    if not ptype.is_composite or not ptype.sub_particles:
+        return [
+            (
+                np.asarray(base_position_nm, dtype=float),
+                ptype.ipsf_interpolator,
+                1.0,
+            )
+        ]
+
+    # Composite case (not yet exercised in the current pipeline). We still
+    # implement the basic structure so that future code only needs to fill in
+    # orientation_matrices and SubParticle definitions.
+    #
+    # For now, if a composite type were to be created manually without
+    # orientations, we treat offsets as already in world coordinates (no
+    # rotation). This is primarily a structural placeholder.
+    world_pos = np.asarray(base_position_nm, dtype=float)
+    sub_infos: list[tuple[np.ndarray, object, float]] = []
+    for sub in ptype.sub_particles:
+        # Apply body-fixed offset without rotation (to be extended later).
+        sub_pos = world_pos + np.asarray(sub.offset_nm, dtype=float)
+        sub_infos.append(
+            (
+                sub_pos,
+                sub.ipsf_interpolator,
+                float(sub.signal_multiplier),
+            )
+        )
+    return sub_infos
+
+
 def generate_video_and_masks(params: dict, particle_instances: list[ParticleInstance]):
     """
     Generate all video frames and segmentation masks by placing particles
@@ -184,13 +250,13 @@ def generate_video_and_masks(params: dict, particle_instances: list[ParticleInst
     motion blur.
 
     This implementation renders each frame on an oversampled, padded canvas that
-    is larger than the final field of view. Each particle's PSF is added directly
-    to this canvas at its physical location using explicit clipping at the canvas
-    boundaries (non-periodic placement). The padding width is chosen so that any
-    truncation of the PSF occurs only where its intensity is negligible in the
-    central region that is ultimately cropped and used for the video. This removes
-    periodic wrap-around artifacts that arise when using circular shifts for PSF
-    placement, while preserving the overall simulation behavior.
+    is larger than the final field of view. Each particle's PSF (for spherical
+    particles) or set of sub-particle PSFs (for future composite particles) is
+    added directly to this canvas at its physical location using explicit
+    clipping at the canvas boundaries (non-periodic placement). The padding
+    width is chosen so that any truncation of the PSF occurs only where its
+    intensity is negligible in the central region that is ultimately cropped
+    and used for the video.
 
     The stationary reference field and background intensity are represented as
     2D maps generated by `chip_pattern.generate_reference_and_background_maps`.
@@ -211,10 +277,11 @@ def generate_video_and_masks(params: dict, particle_instances: list[ParticleInst
           positions at integer frame times.
 
     This function uses ParticleInstance objects as the single source of truth
-    for per-particle state (trajectory, iPSF interpolator, amplitude), which
-    is a structural refactor of the previous implementation that used parallel
-    arrays (trajectories and ipsf_interpolators). The observable behavior and
-    output remain the same.
+    for per-particle state (trajectory, iPSF interpolator, amplitude). The
+    refactor introduced _iter_subparticle_render_info so that future composite
+    particle shapes and rotational dynamics can be added without changing the
+    rest of the rendering pipeline. For the current spherical-only setup, the
+    observable behavior and outputs remain unchanged.
     """
     # --- Basic timing parameters ---
     fps = float(params["fps"])
@@ -424,57 +491,74 @@ def generate_video_and_masks(params: dict, particle_instances: list[ParticleInst
                 pos_floor = traj[frame_idx_floor]
                 pos_ceil = traj[frame_idx_ceil]
                 current_pos_nm = (1.0 - interp_factor) * pos_floor + interp_factor * pos_ceil
-                px, py, pz = current_pos_nm
 
-                # Get the pre-computed scattered field (iPSF) for the particle's z-position.
-                interpolator = instance.particle_type.ipsf_interpolator
-                E_sca_2D = interpolator([pz])[0]
-
-                # Upscale to the oversampled resolution for higher accuracy placement.
-                if os_factor > 1:
-                    pupil_samples = E_sca_2D.shape[0]
-                    center_psf = pupil_samples // 2
-                    E_radial_line = E_sca_2D[center_psf, center_psf:]
-                    max_bin_psf = E_radial_line.size - 1
-
-                    if max_bin_psf > 0:
-                        # Define physical coordinate systems for both source and target grids.
-                        nm_per_pixel_psf = (img_size * pixel_size_nm) / (os_factor * pupil_samples)
-                        r_bins_nm = np.arange(max_bin_psf + 1) * nm_per_pixel_psf
-
-                        nm_per_pixel_os = pixel_size_nm / os_factor
-                        r_os_nm = r_os_flat * nm_per_pixel_os
-
-                        E_real_interp = np.interp(
-                            r_os_nm, r_bins_nm, E_radial_line.real, right=0.0
-                        )
-                        E_imag_interp = np.interp(
-                            r_os_nm, r_bins_nm, E_radial_line.imag, right=0.0
-                        )
-                        E_sca_2D_rescaled = (
-                            E_real_interp + 1j * E_imag_interp
-                        ).reshape(os_size, os_size)
-                    else:
-                        E_sca_2D_rescaled = np.zeros((os_size, os_size), dtype=np.complex128)
-                else:
-                    E_sca_2D_rescaled = E_sca_2D
-
-                # --- Position the PSF on the padded oversampled canvas using explicit clipping ---
-                center_x_px = int(round(px / pixel_size_nm * os_factor))
-                center_y_px = int(round(py / pixel_size_nm * os_factor))
-
-                center_x_canvas = crop_start + center_x_px
-                center_y_canvas = crop_start + center_y_px
-
-                # Scale the PSF by the per-particle amplitude multiplier and
-                # accumulate it non-periodically onto the particle's canvas.
-                psf_scaled = E_sca_2D_rescaled * instance.signal_multiplier
-                _accumulate_psf_on_canvas(
-                    blurred_particle_fields[i],
-                    psf_scaled,
-                    center_x_canvas,
-                    center_y_canvas,
+                # For spherical particles, this yields a single entry; for
+                # future composite types, it may yield multiple sub-particles.
+                sub_infos = _iter_subparticle_render_info(
+                    instance=instance,
+                    base_position_nm=current_pos_nm,
                 )
+
+                for world_pos_nm, sub_interp, local_multiplier in sub_infos:
+                    px, py, pz = world_pos_nm
+
+                    # Get the pre-computed scattered field (iPSF) for the sub-particle's z-position.
+                    E_sca_2D = sub_interp([pz])[0]
+
+                    # Upscale to the oversampled resolution for higher accuracy placement.
+                    if os_factor > 1:
+                        pupil_samples = E_sca_2D.shape[0]
+                        center_psf = pupil_samples // 2
+                        E_radial_line = E_sca_2D[center_psf, center_psf:]
+                        max_bin_psf = E_radial_line.size - 1
+
+                        if max_bin_psf > 0:
+                            # Define physical coordinate systems for both source and target grids.
+                            nm_per_pixel_psf = (
+                                img_size * pixel_size_nm
+                            ) / (os_factor * pupil_samples)
+                            r_bins_nm = np.arange(max_bin_psf + 1) * nm_per_pixel_psf
+
+                            nm_per_pixel_os = pixel_size_nm / os_factor
+                            r_os_nm = r_os_flat * nm_per_pixel_os
+
+                            E_real_interp = np.interp(
+                                r_os_nm, r_bins_nm, E_radial_line.real, right=0.0
+                            )
+                            E_imag_interp = np.interp(
+                                r_os_nm, r_bins_nm, E_radial_line.imag, right=0.0
+                            )
+                            E_sca_2D_rescaled = (
+                                E_real_interp + 1j * E_imag_interp
+                            ).reshape(os_size, os_size)
+                        else:
+                            E_sca_2D_rescaled = np.zeros(
+                                (os_size, os_size), dtype=np.complex128
+                            )
+                    else:
+                        E_sca_2D_rescaled = E_sca_2D
+
+                    # --- Position the PSF on the padded oversampled canvas using explicit clipping ---
+                    center_x_px = int(round(px / pixel_size_nm * os_factor))
+                    center_y_px = int(round(py / pixel_size_nm * os_factor))
+
+                    center_x_canvas = crop_start + center_x_px
+                    center_y_canvas = crop_start + center_y_px
+
+                    # Scale the PSF by the per-particle amplitude multiplier
+                    # and the local sub-particle multiplier, and accumulate it
+                    # non-periodically onto the particle's canvas.
+                    psf_scaled = (
+                        E_sca_2D_rescaled
+                        * instance.signal_multiplier
+                        * local_multiplier
+                    )
+                    _accumulate_psf_on_canvas(
+                        blurred_particle_fields[i],
+                        psf_scaled,
+                        center_x_canvas,
+                        center_y_canvas,
+                    )
 
         # Average the fields from all subsamples to create the final motion-blurred field.
         for i in range(num_particles):
