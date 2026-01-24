@@ -257,7 +257,7 @@ def simulate_trajectories(params):
                 initial_positions[i, 2] = float(np.random.rand()) * (z_range_nm / 2.0)
             elif z_model == "surface_interaction_v2":
                 # Start in the half-space z <= 0. Mirror of reflective_boundary_v1:
-                # sample z uniformly from [-z_range_nm / 2, 0].
+                # sample z uniformly from [-z_stack_range_nm / 2, 0].
                 initial_positions[i, 2] = -float(np.random.rand()) * (z_range_nm / 2.0)
             else:
                 # This should not be reachable due to earlier validation.
@@ -351,3 +351,165 @@ def simulate_trajectories(params):
 
     print("Generated Brownian motion trajectories.")
     return trajectories
+
+
+def _random_small_rotation_matrix(rng: np.random.Generator, std_angle_rad: float) -> np.ndarray:
+    """
+    Generate a random 3D rotation matrix corresponding to a small, isotropic
+    rotation drawn from a zero-mean Gaussian distribution on the rotation
+    angle.
+
+    The rotation axis is uniformly random on the unit sphere; the rotation
+    angle around that axis is drawn from N(0, std_angle_rad^2). For small
+    std_angle_rad this produces a Brownian-like angular step.
+
+    Args:
+        rng (np.random.Generator): Random number generator.
+        std_angle_rad (float): Standard deviation of the rotation angle in radians.
+
+    Returns:
+        np.ndarray: 3x3 rotation matrix.
+    """
+    std_angle_rad = float(std_angle_rad)
+    if std_angle_rad <= 0.0:
+        # No rotation: identity.
+        return np.eye(3, dtype=float)
+
+    # Sample a random rotation axis uniformly on the unit sphere.
+    vec = rng.normal(size=3)
+    norm = np.linalg.norm(vec)
+    if norm == 0.0:
+        # Extremely unlikely; fall back to a fixed axis.
+        axis = np.array([1.0, 0.0, 0.0], dtype=float)
+    else:
+        axis = vec / norm
+
+    # Sample a small rotation angle from a zero-mean Gaussian.
+    angle = rng.normal(loc=0.0, scale=std_angle_rad)
+
+    # Rodrigues' rotation formula.
+    ux, uy, uz = axis
+    c = np.cos(angle)
+    s = np.sin(angle)
+    one_c = 1.0 - c
+
+    R = np.array(
+        [
+            [c + ux * ux * one_c, ux * uy * one_c - uz * s, ux * uz * one_c + uy * s],
+            [uy * ux * one_c + uz * s, c + uy * uy * one_c, uy * uz * one_c - ux * s],
+            [uz * ux * one_c - uy * s, uz * uy * one_c + ux * s, c + uz * uz * one_c],
+        ],
+        dtype=float,
+    )
+    return R
+
+
+def simulate_orientations(params: dict, num_particles: int, num_frames: int) -> np.ndarray | None:
+    """
+    Simulate rotational Brownian motion (orientation trajectories) for a set
+    of particles.
+
+    This function provides the structural counterpart to simulate_trajectories
+    for translation: it defines a per-particle, per-frame orientation timebase
+    as a sequence of 3x3 rotation matrices. The representation is:
+
+        orientations[i, t] -> 3x3 rotation matrix for particle i at frame t,
+
+    where each matrix maps body-fixed coordinates into the lab frame.
+
+    Current usage and behavior:
+        - The main pipeline currently renders only spherical particles, for
+          which the PSF is rotationally symmetric and independent of
+          orientation. As a result, the renderer does not yet use these
+          orientations. This function therefore has no effect on the visual
+          output in the current spherical configuration.
+
+        - The orientation trajectories are nevertheless generated and attached
+          to ParticleInstance objects so that non-spherical composite particles
+          can be added later without changing the core interfaces or motion-
+          blur timing logic.
+
+    Configuration:
+        - The model is controlled by the following optional PARAMS entries:
+
+            "rotational_diffusion_enabled": bool
+                Master switch. If False or absent, this function returns None
+                and no orientations are simulated; ParticleInstance objects
+                will then carry orientation_matrices=None.
+
+            "rotational_step_std_deg": float
+                Standard deviation (in degrees) of the per-frame rotation
+                angle around a random axis. Typical values for small, smooth
+                rotational Brownian motion are in the range 1–10 degrees.
+                Default: 5.0 degrees.
+
+        - The time step for the rotational updates is the frame interval
+          dt = 1 / fps, matching the translational integration in
+          simulate_trajectories. Motion blur sub-sampling uses interpolation
+          between these frame-level orientations via ParticleInstance, which
+          will be implemented when rotational appearance matters for
+          non-spherical composites.
+
+    Args:
+        params (dict): Simulation parameter dictionary (PARAMS). Must contain
+            "fps" when rotational_diffusion_enabled is True.
+        num_particles (int): Number of particles being simulated.
+        num_frames (int): Number of frames in the video.
+
+    Returns:
+        np.ndarray | None:
+            - If rotational_diffusion_enabled is False (or not present),
+              returns None.
+            - Otherwise, returns a numpy array of shape
+              (num_particles, num_frames, 3, 3) with dtype float, where each
+              [i, t] entry is an SO(3) rotation matrix.
+    """
+    rotational_enabled = bool(params.get("rotational_diffusion_enabled", False))
+    if not rotational_enabled:
+        return None
+
+    num_particles = int(num_particles)
+    num_frames = int(num_frames)
+    if num_particles <= 0 or num_frames <= 0:
+        raise ValueError(
+            "simulate_orientations requires positive num_particles and num_frames "
+            f"(got num_particles={num_particles}, num_frames={num_frames})."
+        )
+
+    # Frame interval; kept for potential future use in connecting to a
+    # physically derived rotational diffusion coefficient. Currently, we
+    # treat rotational_step_std_deg as directly specifying the per-frame
+    # angular step scale.
+    fps = float(params["fps"])
+    if fps <= 0.0:
+        raise ValueError("PARAMS['fps'] must be positive when simulating orientations.")
+    _dt = 1.0 / fps  # noqa: F841  # reserved for future physics-based refinement
+
+    # Standard deviation of per-frame rotation angle in radians.
+    step_std_deg = float(params.get("rotational_step_std_deg", 5.0))
+    if step_std_deg < 0.0:
+        raise ValueError(
+            "PARAMS['rotational_step_std_deg'] must be non-negative if provided."
+        )
+    step_std_rad = np.deg2rad(step_std_deg)
+
+    # Use the global np.random RNG for reproducibility under the same seeding
+    # as translational Brownian motion, matching the rest of the pipeline.
+    rng = np.random.default_rng()
+
+    # Allocate orientation array and initialize all particles to identity
+    # orientation at frame 0.
+    orientations = np.zeros((num_particles, num_frames, 3, 3), dtype=float)
+    orientations[:, 0, :, :] = np.eye(3, dtype=float)
+
+    # Perform a random walk on SO(3) for each particle.
+    for i in range(num_particles):
+        for t in range(1, num_frames):
+            R_prev = orientations[i, t - 1]
+            R_step = _random_small_rotation_matrix(rng, step_std_rad)
+            # Post-multiply so that R_t maps body frame to lab frame after
+            # applying the incremental rotation.
+            orientations[i, t] = R_step @ R_prev
+
+    print("Generated rotational Brownian orientation trajectories.")
+    return orientations

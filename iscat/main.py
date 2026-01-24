@@ -8,7 +8,7 @@ from scipy.stats import norm
 # Import simulation components from other files
 from config import PARAMS
 from materials import resolve_particle_refractive_indices
-from trajectory import simulate_trajectories, stokes_einstein_diffusion_coefficient
+from trajectory import simulate_trajectories, stokes_einstein_diffusion_coefficient, simulate_orientations
 from optics import compute_ipsf_stack
 from rendering import generate_video_and_masks
 from postprocessing import apply_background_subtraction, save_video
@@ -246,6 +246,13 @@ def run_simulation(params: dict) -> None:
     # --- Step 1: Simulate particle movement ---
     trajectories_nm = simulate_trajectories(params)
 
+    # --- Step 1b: Simulate rotational Brownian orientations (structural only) ---
+    num_particles = int(params["num_particles"])
+    fps = float(params["fps"])
+    duration_seconds = float(params["duration_seconds"])
+    num_frames = int(fps * duration_seconds)
+    orientations = simulate_orientations(params, num_particles, num_frames)
+
     # --- Helper for per-type z-range expansion and grid construction ---------
     def _build_safe_z_grid_for_type(
         z_min_realized_nm: float,
@@ -340,8 +347,6 @@ def run_simulation(params: dict) -> None:
 
     # --- Step 2: Compute unique iPSF stacks with per-type trajectory-based Z-ranges ---
     print("Pre-computing unique particle iPSF stacks with trajectory-based Z-ranges...")
-    num_particles = params["num_particles"]
-
     # Map type key -> list of particle indices
     type_to_indices = {}
     for i in range(num_particles):
@@ -424,6 +429,7 @@ def run_simulation(params: dict) -> None:
         trajectories_nm=trajectories_nm,
         particle_refractive_indices=particle_refractive_indices,
         ipsf_interpolators_by_type=ipsf_interpolators_by_type,
+        orientations=orientations,
     )
 
     # --- Step 3: Generate raw video frames and masks ---

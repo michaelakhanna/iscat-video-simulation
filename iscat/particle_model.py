@@ -122,6 +122,7 @@ def build_particle_types_and_instances(
     trajectories_nm: np.ndarray,
     particle_refractive_indices: np.ndarray,
     ipsf_interpolators_by_type: Dict[Tuple[float, float, float], IPSFZInterpolator],
+    orientations: Optional[np.ndarray] = None,
 ) -> Tuple[Dict[Tuple[float, float, float], ParticleType], List[ParticleInstance]]:
     """
     Construct ParticleType and ParticleInstance objects for the current
@@ -136,6 +137,15 @@ def build_particle_types_and_instances(
     are an additional representation that downstream components (e.g.,
     rendering) now consume. The numerical results of the simulation remain
     governed by the same trajectories and iPSF stacks as before.
+
+    Orientation handling:
+        - If `orientations` is None, all ParticleInstance objects are created
+          with orientation_matrices=None (spherical behavior).
+        - If `orientations` is provided, it must have shape
+          (num_particles, num_frames, 3, 3). The i-th ParticleInstance then
+          receives orientations[i] as its orientation_matrices. This provides
+          a consistent per-frame orientation timebase that can be used by
+          future non-spherical composite renderers and motion-blur logic.
 
     Args:
         params (dict):
@@ -152,6 +162,11 @@ def build_particle_types_and_instances(
         ipsf_interpolators_by_type (dict):
             Mapping from type_key = (diameter_nm, n_real, n_imag) to the
             IPSFZInterpolator computed for that type in main.run_simulation.
+        orientations (Optional[np.ndarray]):
+            Optional orientation array with shape
+            (num_particles, num_frames, 3, 3). When provided, each particle's
+            orientation_matrices field is populated from this array. When
+            None, orientation_matrices is left as None for all particles.
 
     Returns:
         tuple:
@@ -190,6 +205,16 @@ def build_particle_types_and_instances(
             f"Got {particle_refractive_indices.shape[0]} for num_particles={num_particles}."
         )
 
+    num_frames = trajectories_nm.shape[1]
+
+    if orientations is not None:
+        orientations = np.asarray(orientations, dtype=float)
+        if orientations.shape != (num_particles, num_frames, 3, 3):
+            raise ValueError(
+                "orientations must have shape (num_particles, num_frames, 3, 3) "
+                f"when provided. Got {orientations.shape}."
+            )
+
     # Build ParticleType objects from the provided per-type interpolators.
     # At this stage all types are spherical: is_composite=False and
     # sub_particles=().
@@ -207,8 +232,8 @@ def build_particle_types_and_instances(
 
     # Build ParticleInstance objects, one per particle, referencing the
     # appropriate ParticleType and its trajectory. orientation_matrices is
-    # left as None for all particles; rotational dynamics will use this
-    # field in future extensions.
+    # populated from the provided orientations array when available; otherwise
+    # it is left as None (spherical case).
     instances: List[ParticleInstance] = []
     for i in range(num_particles):
         n_complex = particle_refractive_indices[i]
@@ -228,12 +253,17 @@ def build_particle_types_and_instances(
                 "diameter/refractive_index arrays."
             ) from exc
 
+        if orientations is not None:
+            orientation_matrices = orientations[i].copy()
+        else:
+            orientation_matrices = None
+
         instance = ParticleInstance(
             index=i,
             particle_type=ptype,
             trajectory_nm=trajectories_nm[i],
             signal_multiplier=float(signal_multipliers[i]),
-            orientation_matrices=None,
+            orientation_matrices=orientation_matrices,
         )
         instances.append(instance)
 
