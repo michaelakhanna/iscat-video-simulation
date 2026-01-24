@@ -119,6 +119,12 @@ PARAMS = {
     # Diameter of each particle in nanometers.
     # List or sequence of length num_particles. Each entry must be a positive
     # float or int specifying the diameter of that particle.
+    #
+    # For non-spherical / composite particles (future use), this diameter is
+    # interpreted as the translational *equivalent diameter* used in the
+    # Stokes–Einstein equation (CDD Section 3.2.2). Individual sub-particles
+    # within a composite shape may use the same or different diameters for
+    # their optical PSFs; those are defined in composite_shape_library.
     "particle_diameters_nm": [100, 60],
 
     # Complex refractive index (n + i k) of each particle.
@@ -145,8 +151,8 @@ PARAMS = {
     # explicit indices override material-based values. In this default
     # configuration we rely entirely on material-based lookup.
     "particle_materials": [
-        "Gold",  # 60 nm gold nanoparticle
         "Gold",  # 100 nm gold nanoparticle
+        "Gold",  # 60 nm gold nanoparticle
     ],
 
     # Per-particle scalar multipliers applied to the scattered field amplitude.
@@ -162,6 +168,108 @@ PARAMS = {
     # initialized uniformly over the field of view (x, y) and within the
     # z_stack_range_nm (z), subject to the chosen z-motion constraint model.
     # "particle_initial_positions_nm": [[x1, y1, z1], [x2, y2, z2], ...],
+
+    # Optional per-particle shape model.
+    #
+    # This field provides the high-level "shape model" for each particle,
+    # conceptually matching the CDD notion of spherical vs. non-spherical
+    # particles (Section 3.1, "non_spherical_particle_geometry").
+    #
+    # Semantics:
+    #   - If this key is omitted or set to None, all particles are treated as
+    #     simple spheres: the renderer uses their ParticleType.ipsf_interpolator
+    #     directly with no internal geometry (current behavior).
+    #
+    #   - If provided, it must be a list/sequence of length num_particles,
+    #     where each entry is a string:
+    #
+    #         "spherical":
+    #             Particle is modeled as a single sphere (default).
+    #
+    #         "<name>":
+    #             Particle is modeled as a rigid composite shape whose
+    #             geometry is defined in composite_shape_library[name].
+    #
+    # In this default PARAMS, we omit this key so that behavior remains purely
+    # spherical. Composite shapes can be enabled by presets or advanced users
+    # by adding a "particle_shape_models" entry.
+    #
+    # Example (not active by default):
+    #   "particle_shape_models": ["spherical", "h2o_like"],
+    #
+    # which would treat particle 0 as spherical and particle 1 as a composite
+    # whose geometry is defined in composite_shape_library["h2o_like"].
+    # "particle_shape_models": [...],
+
+    # Library of named composite particle geometries.
+    #
+    # This dictionary maps string shape names to internal sub-particle
+    # definitions. It is the concrete implementation of the conceptual
+    # "non_spherical_particle_geometry" from the CDD (Sections 2.3 and 3.1).
+    #
+    # Each entry has the form:
+    #
+    #   "<shape_name>": {
+    #       "sub_particles": [
+    #           {
+    #               "offset_nm": [dx, dy, dz],
+    #               "diameter_nm": <float or None>,
+    #               "refractive_index": <complex or None>,
+    #               "signal_multiplier": <float, optional>,
+    #           },
+    #           ...
+    #       ]
+    #   }
+    #
+    # where:
+    #   - offset_nm:
+    #       Body-fixed 3D offset in nanometers relative to the composite
+    #       center. This is the coordinate that will be rotated by per-frame
+    #       orientation matrices before being added to the translational
+    #       trajectory.
+    #
+    #   - diameter_nm, refractive_index:
+    #       Optional overrides for the sub-particle's optical type. When
+    #       either is set to None, the parent particle's diameter and/or
+    #       refractive index are used. In the current structural step we
+    #       enforce that any resulting (diameter, n.real, n.imag) combination
+    #       must already exist among the base particle types so that the
+    #       necessary iPSF stacks have been computed.
+    #
+    #   - signal_multiplier:
+    #       Optional local amplitude multiplier applied on top of the parent
+    #       ParticleInstance.signal_multiplier for this sub-particle only.
+    #       Defaults to 1.0 when omitted.
+    #
+    # The default library is empty so that no composites are active unless a
+    # preset or user explicitly adds entries and references them via
+    # particle_shape_models.
+    "composite_shape_library": {
+        # Example skeleton (NOT active; left as documentation only):
+        #
+        # "h2o_like": {
+        #     "sub_particles": [
+        #         {
+        #             "offset_nm": [0.0, 0.0, 0.0],
+        #             "diameter_nm": None,          # inherit parent diameter
+        #             "refractive_index": None,     # inherit parent n
+        #             "signal_multiplier": 1.0,
+        #         },
+        #         {
+        #             "offset_nm": [50.0, 0.0, 0.0],
+        #             "diameter_nm": None,
+        #             "refractive_index": None,
+        #             "signal_multiplier": 1.0,
+        #         },
+        #         {
+        #             "offset_nm": [-50.0, 0.0, 0.0],
+        #             "diameter_nm": None,
+        #             "refractive_index": None,
+        #             "signal_multiplier": 1.0,
+        #         },
+        #     ],
+        # },
+    },
 
     # --- BROWNIAN MOTION ---
     # Absolute temperature of the medium in Kelvin.
@@ -200,6 +308,25 @@ PARAMS = {
     #       available for experiments that require a lower-half-space model.
     #
     "z_motion_constraint_model": "reflective_boundary_v1",
+
+    # Rotational Brownian motion configuration for non-spherical particles.
+    #
+    # These settings control simulate_orientations (trajectory.py). In the
+    # current default configuration rotational diffusion is disabled, so
+    # orientation_matrices is None for all particles and the renderer behaves
+    # identically to the original spherical-only implementation.
+    #
+    #   "rotational_diffusion_enabled":
+    #       When False (default), no orientations are simulated and all
+    #       ParticleInstance.orientation_matrices are set to None.
+    #
+    #   "rotational_step_std_deg":
+    #       Standard deviation of the per-frame rotation angle (in degrees)
+    #       around a random axis when rotational_diffusion_enabled is True.
+    #       For future non-spherical composites this controls how quickly
+    #       orientations change. Default is 5 degrees when enabled.
+    "rotational_diffusion_enabled": False,
+    "rotational_step_std_deg": 5.0,
 
     # --- iPSF & SCATTERING CALCULATION ---
     # Oversampling factor for the internal PSF/canvas resolution.

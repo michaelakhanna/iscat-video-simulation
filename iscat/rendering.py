@@ -180,10 +180,11 @@ def _accumulate_psf_on_canvas(canvas, psf, center_x, center_y):
 def _iter_subparticle_render_info(
     instance: ParticleInstance,
     base_position_nm: np.ndarray,
+    frame_index: int,
 ) -> list[tuple[np.ndarray, object, float]]:
     """
     Compute the list of sub-particle render instructions for a given particle
-    instance at a given (possibly interpolated) position.
+    instance at a given (possibly interpolated) position and frame.
 
     Each returned tuple has the form:
         (world_position_nm, ipsf_interpolator, local_signal_multiplier)
@@ -195,18 +196,30 @@ def _iter_subparticle_render_info(
           scattered field from this sub-particle, on top of the parent
           ParticleInstance.signal_multiplier.
 
-    Current behavior (spherical-only):
-        - For all particles, is_composite is False and sub_particles is empty.
-        - This helper therefore returns a single entry corresponding to the
-          particle's own iPSF at base_position_nm with local_signal_multiplier=1.0.
+    Spherical behavior (current default):
+        - When instance.particle_type.is_composite is False or
+          particle_type.sub_particles is empty, this helper returns a single
+          entry corresponding to the particle's own iPSF at base_position_nm
+          with local_signal_multiplier=1.0. Orientation is ignored because
+          the PSF is radially symmetric.
 
-    Future non-spherical behavior:
-        - When instance.particle_type.is_composite == True, this function will:
-            * Retrieve the per-frame rotation matrix from
-              instance.orientation_matrices.
-            * Rotate each SubParticle.offset_nm into world coordinates.
-            * Add base_position_nm to obtain each sub-particle's world position.
-            * Use each sub-particle's ipsf_interpolator and signal_multiplier.
+    Composite behavior (structural, forward-compatible):
+        - When instance.particle_type.is_composite == True and sub_particles
+          are defined:
+            * If instance.orientation_matrices is not None, we take the
+              3x3 rotation matrix at this frame_index and apply it to each
+              SubParticle.offset_nm to obtain a rotated offset in world
+              coordinates.
+            * If orientation_matrices is None, offsets are treated as already
+              expressed in world coordinates (no rotation).
+            * The rotated (or raw) offset is added to base_position_nm to
+              obtain the world position for each sub-particle.
+
+        - This function does not change any current outputs because:
+            * The default PARAMS does not define any composite shapes, so
+              is_composite is False for all particles.
+            * rotational_diffusion_enabled defaults to False, so
+              orientation_matrices is None for all particles.
     """
     ptype: ParticleType = instance.particle_type
 
@@ -221,25 +234,45 @@ def _iter_subparticle_render_info(
             )
         ]
 
-    # Composite case (not yet exercised in the current pipeline). We still
-    # implement the basic structure so that future code only needs to fill in
-    # orientation_matrices and SubParticle definitions.
-    #
-    # For now, if a composite type were to be created manually without
-    # orientations, we treat offsets as already in world coordinates (no
-    # rotation). This is primarily a structural placeholder.
-    world_pos = np.asarray(base_position_nm, dtype=float)
+    # Composite case.
+    base_world_pos = np.asarray(base_position_nm, dtype=float)
+    if base_world_pos.shape != (3,):
+        raise ValueError(
+            "base_position_nm must be a length-3 vector [x, y, z] in nm."
+        )
+
+    # Determine the rotation matrix for this frame, if available.
+    R = None
+    if instance.orientation_matrices is not None:
+        if frame_index < 0 or frame_index >= instance.orientation_matrices.shape[0]:
+            raise IndexError(
+                f"frame_index={frame_index} is out of range for "
+                f"orientation_matrices shape {instance.orientation_matrices.shape}."
+            )
+        R = instance.orientation_matrices[frame_index]
+
     sub_infos: list[tuple[np.ndarray, object, float]] = []
     for sub in ptype.sub_particles:
-        # Apply body-fixed offset without rotation (to be extended later).
-        sub_pos = world_pos + np.asarray(sub.offset_nm, dtype=float)
+        offset = np.asarray(sub.offset_nm, dtype=float)
+        if offset.shape != (3,):
+            raise ValueError(
+                "SubParticle.offset_nm must be a length-3 vector [dx, dy, dz] in nm."
+            )
+
+        if R is not None:
+            rotated_offset = R @ offset
+        else:
+            rotated_offset = offset
+
+        sub_pos_world = base_world_pos + rotated_offset
         sub_infos.append(
             (
-                sub_pos,
+                sub_pos_world,
                 sub.ipsf_interpolator,
                 float(sub.signal_multiplier),
             )
         )
+
     return sub_infos
 
 
@@ -251,7 +284,7 @@ def generate_video_and_masks(params: dict, particle_instances: list[ParticleInst
 
     This implementation renders each frame on an oversampled, padded canvas that
     is larger than the final field of view. Each particle's PSF (for spherical
-    particles) or set of sub-particle PSFs (for future composite particles) is
+    particles) or set of sub-particle PSFs (for composite particles) is
     added directly to this canvas at its physical location using explicit
     clipping at the canvas boundaries (non-periodic placement). The padding
     width is chosen so that any truncation of the PSF occurs only where its
@@ -277,11 +310,14 @@ def generate_video_and_masks(params: dict, particle_instances: list[ParticleInst
           positions at integer frame times.
 
     This function uses ParticleInstance objects as the single source of truth
-    for per-particle state (trajectory, iPSF interpolator, amplitude). The
-    refactor introduced _iter_subparticle_render_info so that future composite
-    particle shapes and rotational dynamics can be added without changing the
-    rest of the rendering pipeline. For the current spherical-only setup, the
-    observable behavior and outputs remain unchanged.
+    for per-particle state (trajectory, iPSF interpolator, amplitude, and
+    optional orientation). The helper _iter_subparticle_render_info encapsulates
+    the logic for handling both spherical and composite particles so that
+    future changes to composite geometry or rotational dynamics do not require
+    changes to the rest of the rendering pipeline.
+
+    For the current spherical-only setup (default PARAMS), the observable
+    behavior and outputs remain unchanged.
     """
     # --- Basic timing parameters ---
     fps = float(params["fps"])
@@ -493,10 +529,12 @@ def generate_video_and_masks(params: dict, particle_instances: list[ParticleInst
                 current_pos_nm = (1.0 - interp_factor) * pos_floor + interp_factor * pos_ceil
 
                 # For spherical particles, this yields a single entry; for
-                # future composite types, it may yield multiple sub-particles.
+                # composite types, it may yield multiple sub-particles with
+                # rotated offsets.
                 sub_infos = _iter_subparticle_render_info(
                     instance=instance,
                     base_position_nm=current_pos_nm,
+                    frame_index=frame_idx_floor,
                 )
 
                 for world_pos_nm, sub_interp, local_multiplier in sub_infos:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
 
@@ -38,17 +38,13 @@ class ParticleType:
     """
     Describes an optical "particle type" in the simulation.
 
-    In the current (spherical) implementation a particle type corresponds to
-    a single spherical particle characterized by:
+    Spherical case (current default):
         - diameter_nm: physical diameter in nanometers.
         - refractive_index: complex refractive index (n + i k).
         - ipsf_interpolator: spherical iPSF Z-interpolator defined on a
           type-specific z-grid.
 
-    To prepare for non-spherical particles modeled as rigid clusters of
-    spherical sub-particles (CDD Sections 2.3, 3.2, 3.3), this class also
-    carries:
-
+    Composite case (future non-spherical shapes):
         - is_composite:
             False -> the particle is treated as a single sphere; the renderer
                      uses ipsf_interpolator directly (current behavior).
@@ -58,11 +54,9 @@ class ParticleType:
         - sub_particles:
             Tuple of SubParticle objects describing the rigid internal
             geometry in a body-fixed frame. For spherical particles this
-            tuple is empty (is_composite=False). For future non-spherical
-            particles it will list all sub-spheres.
-
-    Current code only constructs spherical ParticleType instances with
-    is_composite=False and sub_particles=().
+            tuple is empty (is_composite=False). For non-spherical particles
+            it lists all spherical sub-components that will be positioned
+            by orientation and translation.
     """
     diameter_nm: float
     refractive_index: complex
@@ -100,21 +94,165 @@ class ParticleInstance:
 
     Orientation representation:
         - orientation_matrices is either:
-            * None (for spherical particles, current code),
+            * None (for spherical particles, current default),
             * or a numpy array of shape (num_frames, 3, 3) where each 3x3
               matrix is a rotation mapping body-fixed coordinates into the
               lab/world frame at that frame index.
 
-        - In this structural refactor, orientation_matrices is always None,
-          and the renderer ignores orientation for all particles. This keeps
-          behavior identical to the previous spherical-only implementation
-          while preparing the interface for rotational Brownian motion.
+        - In the current configuration, rotations are only used when:
+            * params["rotational_diffusion_enabled"] is True, and
+            * the particle is composite (ptype.is_composite=True).
+          Spherical particles ignore orientation; their PSF is radially
+          symmetric.
     """
     index: int
     particle_type: ParticleType
     trajectory_nm: np.ndarray
     signal_multiplier: float
     orientation_matrices: Optional[np.ndarray] = None
+
+
+def _resolve_shape_models(params: dict, num_particles: int) -> List[str]:
+    """
+    Resolve the per-particle shape model strings, defaulting to 'spherical'
+    when no shape information is provided.
+
+    This keeps the behavior of existing configurations unchanged: if
+    PARAMS does not define 'particle_shape_models', all particles are
+    treated as simple spheres.
+    """
+    raw = params.get("particle_shape_models", None)
+    if raw is None:
+        return ["spherical"] * num_particles
+
+    if not isinstance(raw, (list, tuple)):
+        raise TypeError(
+            "PARAMS['particle_shape_models'] must be a list or tuple of "
+            f"length num_particles when provided (got type {type(raw)})."
+        )
+
+    if len(raw) != num_particles:
+        raise ValueError(
+            "Length of PARAMS['particle_shape_models'] "
+            f"({len(raw)}) must match PARAMS['num_particles'] ({num_particles})."
+        )
+
+    models: List[str] = []
+    for idx, entry in enumerate(raw):
+        if entry is None:
+            models.append("spherical")
+        else:
+            models.append(str(entry).strip())
+    return models
+
+
+def _build_composite_subparticles_for_instance(
+    params: dict,
+    particle_index: int,
+    base_diameter_nm: float,
+    base_refractive_index: complex,
+    ipsf_interpolators_by_type: Dict[Tuple[float, float, float], IPSFZInterpolator],
+) -> Tuple[SubParticle, ...]:
+    """
+    Build the list of SubParticle objects for a single composite particle
+    instance, using the composite_shape_library definition and enforcing that
+    all sub-particle optical types already exist in ipsf_interpolators_by_type.
+
+    This structural rule ensures we never request an iPSF for a type that
+    was not precomputed in main.run_simulation. In this step we purposely
+    restrict configurations so that composite shapes reuse existing spherical
+    PSF types; allowing sub-particle-only types would require extending the
+    PSF precomputation logic.
+    """
+    library: Dict[str, Any] = params.get("composite_shape_library", {})
+    if not isinstance(library, dict):
+        raise TypeError(
+            "PARAMS['composite_shape_library'] must be a dictionary when provided."
+        )
+
+    shape_models = _resolve_shape_models(params, int(params["num_particles"]))
+    shape_model = shape_models[particle_index]
+    if shape_model.lower() == "spherical":
+        return ()
+
+    if shape_model not in library:
+        raise ValueError(
+            f"Particle {particle_index}: shape model '{shape_model}' is not "
+            "defined in PARAMS['composite_shape_library']."
+        )
+
+    shape_def = library[shape_model]
+    sub_defs = shape_def.get("sub_particles", None)
+    if not isinstance(sub_defs, list) or len(sub_defs) == 0:
+        raise ValueError(
+            f"Composite shape '{shape_model}' must define a non-empty "
+            "'sub_particles' list in composite_shape_library."
+        )
+
+    sub_particles: List[SubParticle] = []
+    for sub_idx, sub_def in enumerate(sub_defs):
+        if not isinstance(sub_def, dict):
+            raise TypeError(
+                f"Composite shape '{shape_model}' sub_particles[{sub_idx}] "
+                "must be a dictionary."
+            )
+
+        if "offset_nm" not in sub_def:
+            raise ValueError(
+                f"Composite shape '{shape_model}' sub_particles[{sub_idx}] "
+                "must define 'offset_nm'."
+            )
+
+        offset_nm_arr = np.asarray(sub_def["offset_nm"], dtype=float)
+        if offset_nm_arr.shape != (3,):
+            raise ValueError(
+                f"Composite shape '{shape_model}' sub_particles[{sub_idx}]."
+                "offset_nm must be a length-3 array-like [dx, dy, dz] in nm."
+            )
+
+        diam_sub = sub_def.get("diameter_nm", None)
+        if diam_sub is None:
+            diam_sub = float(base_diameter_nm)
+        else:
+            diam_sub = float(diam_sub)
+
+        n_sub = sub_def.get("refractive_index", None)
+        if n_sub is None:
+            n_sub_complex = complex(base_refractive_index)
+        else:
+            n_sub_complex = complex(n_sub)
+
+        type_key_sub = (float(diam_sub), float(n_sub_complex.real), float(n_sub_complex.imag))
+        if type_key_sub not in ipsf_interpolators_by_type:
+            raise KeyError(
+                "Composite sub-particle for particle index "
+                f"{particle_index} (shape '{shape_model}', sub index {sub_idx}) "
+                f"requires optical type_key={type_key_sub}, but no iPSF "
+                "interpolator was computed for this type. In the current "
+                "structural configuration, all composite sub-particles must "
+                "reuse optical types already present among the base particles."
+            )
+
+        ipsf_interp = ipsf_interpolators_by_type[type_key_sub]
+
+        signal_multiplier_local = float(sub_def.get("signal_multiplier", 1.0))
+        if signal_multiplier_local < 0.0:
+            raise ValueError(
+                f"Composite shape '{shape_model}' sub_particles[{sub_idx}]."
+                "signal_multiplier must be non-negative."
+            )
+
+        sub_particles.append(
+            SubParticle(
+                offset_nm=offset_nm_arr,
+                diameter_nm=diam_sub,
+                refractive_index=n_sub_complex,
+                ipsf_interpolator=ipsf_interp,
+                signal_multiplier=signal_multiplier_local,
+            )
+        )
+
+    return tuple(sub_particles)
 
 
 def build_particle_types_and_instances(
@@ -133,19 +271,31 @@ def build_particle_types_and_instances(
     structured objects, using the existing per-type iPSF interpolators that
     were computed in main.run_simulation.
 
-    It does not change any behavior of the simulation; the returned objects
-    are an additional representation that downstream components (e.g.,
-    rendering) now consume. The numerical results of the simulation remain
-    governed by the same trajectories and iPSF stacks as before.
+    Behavior preservation:
+        - When PARAMS does not define 'particle_shape_models' or defines all
+          entries as "spherical", every particle is represented as a simple
+          sphere. ParticleType.is_composite=False and sub_particles=().
+          This matches the previous behavior exactly.
+
+        - Composite shapes can be enabled by:
+            * Defining PARAMS["composite_shape_library"][shape_name] with
+              sub-particle offsets and optical overrides, and
+            * Setting PARAMS["particle_shape_models"][i] = shape_name for
+              the desired particles.
+
+          In the current structural step, all sub-particle optical types must
+          reuse existing per-type iPSF interpolators: any (diameter, n.real,
+          n.imag) combination used by a sub-particle must appear among the
+          base particle types. Violations raise a clear error.
 
     Orientation handling:
         - If `orientations` is None, all ParticleInstance objects are created
-          with orientation_matrices=None (spherical behavior).
+          with orientation_matrices=None (spherical / orientation-ignored).
         - If `orientations` is provided, it must have shape
           (num_particles, num_frames, 3, 3). The i-th ParticleInstance then
-          receives orientations[i] as its orientation_matrices. This provides
-          a consistent per-frame orientation timebase that can be used by
-          future non-spherical composite renderers and motion-blur logic.
+          receives orientations[i] as its orientation_matrices. Composite
+          particles use these matrices to rotate sub-particle offsets during
+          rendering; spherical particles ignore them.
 
     Args:
         params (dict):
@@ -175,7 +325,7 @@ def build_particle_types_and_instances(
 
     Raises:
         ValueError: If the lengths or shapes of the inputs are inconsistent
-            with PARAMS["num_particles"].
+            with PARAMS["num_particles"] or the trajectory/orientation shapes.
     """
     num_particles = int(params["num_particles"])
 
@@ -215,14 +365,19 @@ def build_particle_types_and_instances(
                 f"when provided. Got {orientations.shape}."
             )
 
-    # Build ParticleType objects from the provided per-type interpolators.
-    # At this stage all types are spherical: is_composite=False and
-    # sub_particles=().
-    particle_types: Dict[Tuple[float, float, float], ParticleType] = {}
+    # Resolve per-particle shape models once.
+    shape_models = _resolve_shape_models(params, num_particles)
+
+    # Build the base spherical ParticleType objects from the provided per-type
+    # interpolators. These represent the optical types (diameter, n) that were
+    # used to compute the PSF stacks. Composite ParticleTypes will be created
+    # per logical particle below and share these iPSF building blocks via
+    # SubParticle definitions.
+    spherical_types: Dict[Tuple[float, float, float], ParticleType] = {}
     for type_key, interpolator in ipsf_interpolators_by_type.items():
         diam_nm, n_real, n_imag = type_key
         n_complex = complex(n_real, n_imag)
-        particle_types[type_key] = ParticleType(
+        spherical_types[type_key] = ParticleType(
             diameter_nm=float(diam_nm),
             refractive_index=n_complex,
             ipsf_interpolator=interpolator,
@@ -230,28 +385,82 @@ def build_particle_types_and_instances(
             sub_particles=(),
         )
 
+    # We maintain a dictionary of all ParticleType objects (both spherical and
+    # composite) so that if multiple particles share the same composite shape
+    # and optical base type, they can share the same ParticleType instance.
+    particle_types: Dict[Tuple[float, float, float, str], ParticleType] = {}
+
+    def _get_or_create_particle_type_for_particle(
+        p_index: int,
+        base_type_key: Tuple[float, float, float],
+    ) -> ParticleType:
+        """
+        For a given particle index and its base spherical type_key, either
+        return the existing ParticleType (spherical or composite) or create
+        a new one if this combination of base type and shape model has not
+        been seen before.
+
+        The composite key is (diameter, n.real, n.imag, shape_model).
+        """
+        shape_model = shape_models[p_index]
+        # Normalize 'spherical' explicitly.
+        if shape_model.lower() == "spherical":
+            # For spherical particles we always reuse the spherical ParticleType.
+            diam_nm, n_real, n_imag = base_type_key
+            spherical_ptype = spherical_types[base_type_key]
+            composite_key = (float(diam_nm), float(n_real), float(n_imag), "spherical")
+            # Ensure mapping is consistent but do not duplicate objects.
+            particle_types.setdefault(composite_key, spherical_ptype)
+            return spherical_ptype
+
+        # Composite case: use both optical type and shape model in the key.
+        diam_nm, n_real, n_imag = base_type_key
+        composite_key = (float(diam_nm), float(n_real), float(n_imag), shape_model)
+
+        if composite_key in particle_types:
+            return particle_types[composite_key]
+
+        # Create a new composite ParticleType: populate sub_particles by
+        # resolving composite_shape_library for this particle.
+        base_ptype = spherical_types[base_type_key]
+        sub_particles = _build_composite_subparticles_for_instance(
+            params=params,
+            particle_index=p_index,
+            base_diameter_nm=base_ptype.diameter_nm,
+            base_refractive_index=base_ptype.refractive_index,
+            ipsf_interpolators_by_type=ipsf_interpolators_by_type,
+        )
+
+        composite_ptype = ParticleType(
+            diameter_nm=base_ptype.diameter_nm,
+            refractive_index=base_ptype.refractive_index,
+            ipsf_interpolator=base_ptype.ipsf_interpolator,
+            is_composite=True,
+            sub_particles=sub_particles,
+        )
+        particle_types[composite_key] = composite_ptype
+        return composite_ptype
+
     # Build ParticleInstance objects, one per particle, referencing the
-    # appropriate ParticleType and its trajectory. orientation_matrices is
-    # populated from the provided orientations array when available; otherwise
-    # it is left as None (spherical case).
+    # appropriate ParticleType (spherical or composite) and its trajectory.
     instances: List[ParticleInstance] = []
     for i in range(num_particles):
         n_complex = particle_refractive_indices[i]
-        type_key = (
+        base_type_key = (
             float(diameters_nm[i]),
             float(n_complex.real),
             float(n_complex.imag),
         )
 
-        try:
-            ptype = particle_types[type_key]
-        except KeyError as exc:
+        if base_type_key not in spherical_types:
             raise KeyError(
-                "No ParticleType found for particle index {i} with type_key "
-                f"{type_key}. This indicates a mismatch between the keys used "
-                "to build ipsf_interpolators_by_type and the per-particle "
-                "diameter/refractive_index arrays."
-            ) from exc
+                "No base spherical ParticleType found for particle index "
+                f"{i} with type_key {base_type_key}. This indicates a mismatch "
+                "between the keys used to build ipsf_interpolators_by_type and "
+                "the per-particle diameter/refractive_index arrays."
+            )
+
+        ptype = _get_or_create_particle_type_for_particle(i, base_type_key)
 
         if orientations is not None:
             orientation_matrices = orientations[i].copy()
@@ -267,4 +476,7 @@ def build_particle_types_and_instances(
         )
         instances.append(instance)
 
-    return particle_types, instances
+    # Expose only the underlying spherical types keyed by optical type for
+    # external tooling that might depend on the old mapping. The rendering
+    # pipeline only needs the list of instances.
+    return spherical_types, instances
