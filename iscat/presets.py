@@ -380,11 +380,72 @@ def _build_nanoplastic_surface_experiment(
     return params
 
 
+def _build_nanoplastic_surface_nonspherical_experiment(
+    base_params: Dict[str, Any],
+    rng: np.random.Generator,
+) -> Dict[str, Any]:
+    """
+    Construct parameters for the 'nanoplastic_surface_nonspherical' experiment.
+
+    This preset is a minimal extension of 'nanoplastic_surface' that exercises
+    the existing composite/rotational pipeline in a controlled, visible way,
+    without changing the behavior of any other presets or the base PARAMS:
+
+        - It first builds a standard 'nanoplastic_surface' configuration
+          (instrument, materials, diameters, z-model, exposure).
+        - It then configures one particle (index 0) to use the 'h2o_like'
+          composite shape from PARAMS['composite_shape_library'].
+        - Rotational diffusion is enabled with a moderate per-frame step
+          (~10 degrees) so that the orientation changes over the course of
+          the video, but not so rapidly that adjacent frames look unrelated.
+
+    The composite shape 'h2o_like' is already defined in config.PARAMS with
+    sub-particle offsets on the order of the pixel size (e.g., ±2400 nm arms
+    for 600 nm pixels). Combined with the existing oversampling and PSF
+    placement, this makes the non-spherical appearance clearly visible in
+    standard videos generated via run_simulation(params).
+
+    All numeric ranges remain physically reasonable, and the preset does not
+    modify any global state. It only returns a self-contained params dict.
+    """
+    if not isinstance(base_params, dict):
+        raise TypeError("base_params must be a dictionary.")
+
+    # Start from the standard nanoplastic_surface experiment.
+    params = _build_nanoplastic_surface_experiment(base_params, rng)
+
+    # Ensure we have at least one particle to assign the composite shape to.
+    num_particles = int(params.get("num_particles", 1))
+    if num_particles <= 0:
+        raise ValueError(
+            "PARAMS['num_particles'] must be positive for the nanoplastic_surface_nonspherical experiment."
+        )
+
+    # Initialize shape models: default all to 'spherical', then set particle 0
+    # to the 'h2o_like' composite shape defined in config.PARAMS.
+    shape_models = ["spherical"] * num_particles
+    shape_models[0] = "h2o_like"
+    params["particle_shape_models"] = shape_models
+
+    # Enable rotational diffusion so that the composite particle actually
+    # changes orientation over time. The rotational_step_std_deg value is
+    # chosen to be moderate: small enough to keep adjacent frames related,
+    # but large enough that the particle explores different orientations over
+    # the duration of a typical short video.
+    params["rotational_diffusion_enabled"] = True
+    # If the base params already specify a step size, keep it; otherwise use 10°.
+    if "rotational_step_std_deg" not in params:
+        params["rotational_step_std_deg"] = 10.0
+
+    return params
+
+
 # Mapping from canonical experiment preset names to their builder functions.
 _EXPERIMENT_PRESET_BUILDERS: Dict[
     str, Callable[[Dict[str, Any], np.random.Generator], Dict[str, Any]]
 ] = {
     "nanoplastic_surface": _build_nanoplastic_surface_experiment,
+    "nanoplastic_surface_nonspherical": _build_nanoplastic_surface_nonspherical_experiment,
 }
 
 
