@@ -177,12 +177,17 @@ def _accumulate_psf_on_canvas(canvas, psf, center_x, center_y):
     canvas[y0_c:y1_c, x0_c:x1_c] += psf[ky0:ky1, kx0:kx1]
 
 
+# ---------------------------------------------------------------------------
+# Orientation interpolation helpers (quaternions and slerp)
+# ---------------------------------------------------------------------------
+
 def _rotation_matrix_to_quaternion(R: np.ndarray) -> np.ndarray:
     """
     Convert a 3x3 rotation matrix to a unit quaternion [w, x, y, z].
 
-    The formula follows a standard numerically stable branch-based approach.
-    Input is assumed to be a proper rotation matrix (orthonormal, det ~ 1).
+    This helper uses a standard numerically stable branch-based algorithm.
+    It assumes R is a proper rotation (orthonormal, det ~ 1), as produced by
+    simulate_orientations. The output is always normalized.
     """
     R = np.asarray(R, dtype=float)
     if R.shape != (3, 3):
@@ -196,7 +201,6 @@ def _rotation_matrix_to_quaternion(R: np.ndarray) -> np.ndarray:
         y = (R[0, 2] - R[2, 0]) * s
         z = (R[1, 0] - R[0, 1]) * s
     else:
-        # Find the largest diagonal element and proceed accordingly.
         if R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
             s = 2.0 * np.sqrt(max(1.0 + R[0, 0] - R[1, 1] - R[2, 2], 0.0))
             w = (R[2, 1] - R[1, 2]) / s
@@ -219,7 +223,7 @@ def _rotation_matrix_to_quaternion(R: np.ndarray) -> np.ndarray:
     q = np.array([w, x, y, z], dtype=float)
     norm = np.linalg.norm(q)
     if norm == 0.0:
-        # Fallback: identity quaternion.
+        # Pathological case; fall back to identity.
         return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
     return q / norm
 
@@ -227,13 +231,14 @@ def _rotation_matrix_to_quaternion(R: np.ndarray) -> np.ndarray:
 def _quaternion_to_rotation_matrix(q: np.ndarray) -> np.ndarray:
     """
     Convert a unit quaternion [w, x, y, z] to a 3x3 rotation matrix.
+
+    Input is normalized internally to guard against numerical drift.
     """
     q = np.asarray(q, dtype=float)
     if q.shape != (4,):
         raise ValueError("Quaternion must have shape (4,) as [w, x, y, z].")
 
     w, x, y, z = q
-    # Ensure unit length to guard against numerical drift.
     norm = np.linalg.norm(q)
     if norm == 0.0:
         w, x, y, z = 1.0, 0.0, 0.0, 0.0
@@ -272,33 +277,31 @@ def _slerp_quaternions(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
 
     q(t) = slerp(q0, q1; t), where t in [0, 1].
 
-    Handles the antipodal ambiguity by flipping q1 if needed so that the
-    interpolation follows the shortest path on the 4D unit sphere.
+    The interpolation follows the shortest path on the 4D unit sphere by
+    flipping q1 if necessary to ensure the dot product is non-negative.
     """
     q0 = np.asarray(q0, dtype=float)
     q1 = np.asarray(q1, dtype=float)
     if q0.shape != (4,) or q1.shape != (4,):
         raise ValueError("Quaternions must have shape (4,) as [w, x, y, z].")
 
-    # Normalize inputs to guard against numerical drift.
+    # Normalize inputs.
     q0 = q0 / (np.linalg.norm(q0) or 1.0)
     q1 = q1 / (np.linalg.norm(q1) or 1.0)
 
     dot = float(np.dot(q0, q1))
 
-    # If dot < 0, negate q1 to take the shorter path.
+    # Take the shortest path: if dot < 0, negate q1.
     if dot < 0.0:
         q1 = -q1
         dot = -dot
 
-    # Clamp to avoid numerical issues with acos.
     dot = min(max(dot, -1.0), 1.0)
 
     if dot > 0.9995:
-        # Quaternions are nearly identical; use linear interpolation.
+        # Nearly identical; use linear interpolation and renormalize.
         q = (1.0 - t) * q0 + t * q1
-        norm = np.linalg.norm(q)
-        return q / (norm or 1.0)
+        return q / (np.linalg.norm(q) or 1.0)
 
     theta_0 = np.arccos(dot)
     sin_theta_0 = np.sin(theta_0)
@@ -319,6 +322,10 @@ def _interpolate_orientation_for_instance(
     """
     Interpolate the orientation of a particle instance at a fractional frame index.
 
+    This helper converts discrete per-frame orientations into a continuous
+    orientation in time that is consistent with the translational interpolation
+    used for motion blur.
+
     Args:
         instance (ParticleInstance): The particle for which to compute orientation.
         time_index_float (float): Fractional frame index, e.g., 3.25 means
@@ -327,7 +334,7 @@ def _interpolate_orientation_for_instance(
     Returns:
         np.ndarray | None:
             - 3x3 rotation matrix for the interpolated orientation if
-              orientation_matrices is defined.
+              instance.orientation_matrices is defined.
             - None if the instance has no orientation_matrices (spherical
               particle or rotational diffusion disabled).
     """
@@ -339,7 +346,7 @@ def _interpolate_orientation_for_instance(
     if num_frames == 0:
         return None
 
-    # Clamp time index into [0, num_frames - 1].
+    # Clamp the time index into the valid range [0, num_frames - 1].
     t = float(time_index_float)
     if t <= 0.0:
         return orientations[0]
@@ -351,18 +358,21 @@ def _interpolate_orientation_for_instance(
     alpha = t - t_floor
 
     if t_ceil >= num_frames:
-        # Degenerate edge case; fall back to the last frame orientation.
         return orientations[-1]
 
     R0 = orientations[t_floor]
     R1 = orientations[t_ceil]
 
-    # Convert to quaternions, slerp, then back to a rotation matrix.
+    # Convert to quaternions, interpolate, and convert back to a rotation matrix.
     q0 = _rotation_matrix_to_quaternion(R0)
     q1 = _rotation_matrix_to_quaternion(R1)
     q_interp = _slerp_quaternions(q0, q1, alpha)
     return _quaternion_to_rotation_matrix(q_interp)
 
+
+# ---------------------------------------------------------------------------
+# Sub-particle placement helper
+# ---------------------------------------------------------------------------
 
 def _iter_subparticle_render_info(
     instance: ParticleInstance,
@@ -383,7 +393,7 @@ def _iter_subparticle_render_info(
           scattered field from this sub-particle, on top of the parent
           ParticleInstance.signal_multiplier.
 
-    Spherical behavior (current default):
+    Spherical behavior (default):
         - When instance.particle_type.is_composite is False or
           particle_type.sub_particles is empty, this helper returns a single
           entry corresponding to the particle's own iPSF at base_position_nm
@@ -457,6 +467,10 @@ def _iter_subparticle_render_info(
 
     return sub_infos
 
+
+# ---------------------------------------------------------------------------
+# Main rendering function
+# ---------------------------------------------------------------------------
 
 def generate_video_and_masks(params: dict, particle_instances: list[ParticleInstance]):
     """
@@ -685,10 +699,9 @@ def generate_video_and_masks(params: dict, particle_instances: list[ParticleInst
             start_time = frame_center_time - 0.5 * exposure_time_s
             current_time = start_time + (s + 0.5) * sub_dt
 
+            # normalized_time is a fractional frame index measured in frame intervals:
+            # 0.0 at the first frame center, 1.0 at the second, etc.
             normalized_time = current_time / frame_interval_s
-            # normalized_time is measured in "frame intervals", so it is a
-            # fractional frame index: 0.0 at the first frame center, 1.0 at
-            # the second, etc.
             time_index_float = normalized_time
 
             frame_idx_floor = int(np.floor(normalized_time))
@@ -708,7 +721,6 @@ def generate_video_and_masks(params: dict, particle_instances: list[ParticleInst
             # indices.
             for i, instance in enumerate(particle_instances):
                 traj = instance.trajectory_nm  # shape (num_frames, 3)
-                # Safety check: ensure the trajectory length matches num_frames.
                 if traj.shape[0] != num_frames or traj.shape[1] != 3:
                     raise ValueError(
                         "ParticleInstance %d has trajectory shape %s, expected (%d, 3)."
@@ -719,7 +731,9 @@ def generate_video_and_masks(params: dict, particle_instances: list[ParticleInst
                 pos_ceil = traj[frame_idx_ceil]
                 current_pos_nm = (1.0 - interp_factor) * pos_floor + interp_factor * pos_ceil
 
-                # Orientation interpolation is handled by a dedicated helper.
+                # Orientation interpolation is handled by a dedicated helper so
+                # that rotational motion is sampled at the same sub-frame times
+                # as translational motion.
                 orientation_matrix = _interpolate_orientation_for_instance(
                     instance=instance,
                     time_index_float=time_index_float,

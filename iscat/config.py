@@ -125,7 +125,7 @@ PARAMS = {
     # Stokes–Einstein equation (CDD Section 3.2.2). Individual sub-particles
     # within a composite shape may use the same or different diameters for
     # their optical PSFs; those are defined in composite_shape_library.
-    "particle_diameters_nm": [100, 150],
+    "particle_diameters_nm": [100, 200],
 
     # Complex refractive index (n + i k) of each particle.
     # List/sequence of length num_particles. Each entry can be:
@@ -260,14 +260,14 @@ PARAMS = {
                 {
                     # First "arm" offset; magnitude ~1 pixel in-plane for the
                     # default 600 nm pixel size.
-                    "offset_nm": [600.0, 0.0, 0.0],
+                    "offset_nm": [2400.0, 0.0, 0.0],
                     "diameter_nm": None,
                     "refractive_index": None,
                     "signal_multiplier": 1.0,
                 },
                 {
                     # Second "arm" offset; symmetric around the x-axis.
-                    "offset_nm": [-600.0, 0.0, 0.0],
+                    "offset_nm": [-2400.0, 0.0, 0.0],
                     "diameter_nm": None,
                     "refractive_index": None,
                     "signal_multiplier": 1.0,
