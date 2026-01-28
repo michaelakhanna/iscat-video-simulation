@@ -345,52 +345,158 @@ def run_simulation(params: dict) -> None:
 
         return z_values
 
-    # --- Step 2: Compute unique iPSF stacks with per-type trajectory-based Z-ranges ---
-    print("Pre-computing unique particle iPSF stacks with trajectory-based Z-ranges...")
-    # Map type key -> list of particle indices
+    # --- Step 2a: Collect all required optical types (base + composite) -----
+    #
+    # Structural change: instead of deriving the set of optical types solely
+    # from the base per-particle (diameter, n) arrays, we now also include any
+    # additional optical types referenced by composite sub-particles via
+    # PARAMS['composite_shape_library']. This ensures that the iPSF stacks are
+    # computed for *all* spherical building blocks needed by both spherical
+    # and composite particles, and avoids hidden coupling between base
+    # particle lists and composite definitions.
+    #
+    # The collection logic is centralized here so that future composite
+    # shapes with sub-particle-specific diameters or refractive indices are
+    # handled automatically.
     type_to_indices = {}
+    type_keys_required = set()
+
+    # 1) Base particle optical types from per-particle diameter and n.
     for i in range(num_particles):
         n_complex = particle_refractive_indices[i]
         key = (
-            diameters_nm[i],
+            float(diameters_nm[i]),
             float(n_complex.real),
             float(n_complex.imag),
         )
         type_to_indices.setdefault(key, []).append(i)
+        type_keys_required.add(key)
 
+    # 2) Composite sub-particle optical types from composite_shape_library.
+    composite_library = params.get("composite_shape_library", {})
+    if composite_library is not None and isinstance(composite_library, dict):
+        # Resolve per-particle shape models once, reusing the logic in
+        # particle_model._resolve_shape_models. We do this locally to avoid a
+        # circular import, using the same semantics: default to "spherical"
+        # when the key is absent.
+        raw_shape_models = params.get("particle_shape_models", None)
+        if raw_shape_models is None:
+            shape_models = ["spherical"] * num_particles
+        else:
+            if not isinstance(raw_shape_models, (list, tuple)):
+                raise TypeError(
+                    "PARAMS['particle_shape_models'] must be a list or tuple of "
+                    "length num_particles when provided."
+                )
+            if len(raw_shape_models) != num_particles:
+                raise ValueError(
+                    "Length of PARAMS['particle_shape_models'] "
+                    f"({len(raw_shape_models)}) must match PARAMS['num_particles'] "
+                    f"({num_particles})."
+                )
+            shape_models = [
+                "spherical" if entry is None else str(entry).strip()
+                for entry in raw_shape_models
+            ]
+
+        for p_idx in range(num_particles):
+            shape_name = shape_models[p_idx]
+            if shape_name.lower() == "spherical":
+                # No composite geometry for this particle.
+                continue
+
+            if shape_name not in composite_library:
+                # The detailed validation is performed later in the particle
+                # model builder; here we conservatively skip unknown shapes
+                # rather than guessing their content.
+                continue
+
+            shape_def = composite_library[shape_name]
+            sub_defs = shape_def.get("sub_particles", None)
+            if not isinstance(sub_defs, list) or len(sub_defs) == 0:
+                # Invalid or empty definition; detailed error is handled later.
+                continue
+
+            base_diam_nm = float(diameters_nm[p_idx])
+            base_n = particle_refractive_indices[p_idx]
+            base_n_complex = complex(base_n)
+
+            for sub_def in sub_defs:
+                if not isinstance(sub_def, dict):
+                    continue
+
+                # Diameter override for this sub-particle.
+                diam_sub = sub_def.get("diameter_nm", None)
+                if diam_sub is None:
+                    diam_sub_val = base_diam_nm
+                else:
+                    diam_sub_val = float(diam_sub)
+
+                # Refractive index override for this sub-particle.
+                n_sub = sub_def.get("refractive_index", None)
+                if n_sub is None:
+                    n_sub_complex = base_n_complex
+                else:
+                    n_sub_complex = complex(n_sub)
+
+                type_key_sub = (
+                    float(diam_sub_val),
+                    float(n_sub_complex.real),
+                    float(n_sub_complex.imag),
+                )
+                type_keys_required.add(type_key_sub)
+
+    # --- Step 2b: Compute unique iPSF stacks with per-type trajectory-based Z-ranges ---
+    print("Pre-computing unique particle iPSF stacks with trajectory-based Z-ranges...")
     z_step_nm = float(params["z_stack_step_nm"])
     if z_step_nm <= 0.0:
         raise ValueError("PARAMS['z_stack_step_nm'] must be positive.")
 
-    # For each type, compute the iPSF stack and store it keyed by type_key.
     ipsf_interpolators_by_type = {}
 
-    for type_key, indices in type_to_indices.items():
+    # For each required optical type, determine which particle trajectories
+    # contribute z-statistics for that type (if any), then build a safe z-grid
+    # and compute the PSF stack. For types that appear only in composite
+    # sub-particles (and not as base particle types), we fall back to using
+    # the global z_range derived from params['z_stack_range_nm'] so that they
+    # still receive a physically reasonable axial extent.
+    default_z_range_nm = float(params.get("z_stack_range_nm", 30500.0))
+    default_half_span_nm = 0.5 * default_z_range_nm
+
+    for type_key in sorted(type_keys_required):
         diam_nm_type, n_real, n_imag = type_key
-        indices_array = np.asarray(indices, dtype=int)
+        indices = type_to_indices.get(type_key, None)
 
-        # Extract all z positions for this type: shape (num_type_particles, num_frames)
-        z_positions_type = trajectories_nm[indices_array, :, 2]
-        z_min_realized = float(np.min(z_positions_type))
-        z_max_realized = float(np.max(z_positions_type))
+        if indices is not None and len(indices) > 0:
+            indices_array = np.asarray(indices, dtype=int)
+            z_positions_type = trajectories_nm[indices_array, :, 2]
+            z_min_realized = float(np.min(z_positions_type))
+            z_max_realized = float(np.max(z_positions_type))
 
-        # Build a safe, type-specific z grid based on the realized extremes.
-        z_values_type = _build_safe_z_grid_for_type(
-            z_min_realized_nm=z_min_realized,
-            z_max_realized_nm=z_max_realized,
-            z_step_nm=z_step_nm,
-        )
+            z_values_type = _build_safe_z_grid_for_type(
+                z_min_realized_nm=z_min_realized,
+                z_max_realized_nm=z_max_realized,
+                z_step_nm=z_step_nm,
+            )
+        else:
+            # This optical type is not used as a base particle type; it was
+            # referenced only in composite sub-particles. There are no direct
+            # trajectory samples for it, so we construct a symmetric z-grid
+            # around z = 0 using the configured z_stack_range_nm as a fallback.
+            z_center = 0.0
+            z_min_safe = z_center - default_half_span_nm
+            z_max_safe = z_center + default_half_span_nm
+            z_values_type = np.arange(
+                z_min_safe, z_max_safe + z_step_nm, z_step_nm, dtype=float
+            )
 
         print(
             "  Particle type (diameter = %.1f nm, n = %.4f + %.4fi): "
-            "z_min_realized = %.1f nm, z_max_realized = %.1f nm, "
-            "expanded to [%.1f, %.1f] nm with %d slices."
+            "z-range [% .1f, % .1f] nm with %d slices."
             % (
                 float(diam_nm_type),
                 float(n_real),
                 float(n_imag),
-                z_min_realized,
-                z_max_realized,
                 float(z_values_type[0]),
                 float(z_values_type[-1]),
                 int(z_values_type.size),
@@ -410,7 +516,7 @@ def run_simulation(params: dict) -> None:
     ipsf_interpolators = [
         ipsf_interpolators_by_type[
             (
-                diameters_nm[i],
+                float(diameters_nm[i]),
                 float(particle_refractive_indices[i].real),
                 float(particle_refractive_indices[i].imag),
             )
@@ -418,7 +524,7 @@ def run_simulation(params: dict) -> None:
         for i in range(num_particles)
     ]
 
-    # --- Step 2b: Build ParticleType and ParticleInstance objects -------------
+    # --- Step 2c: Build ParticleType and ParticleInstance objects -------------
     #
     # ParticleType/ParticleInstance provide a structured view over the same
     # data used to build ipsf_interpolators. They are now the primary

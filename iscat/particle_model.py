@@ -155,14 +155,45 @@ def _build_composite_subparticles_for_instance(
 ) -> Tuple[SubParticle, ...]:
     """
     Build the list of SubParticle objects for a single composite particle
-    instance, using the composite_shape_library definition and enforcing that
-    all sub-particle optical types already exist in ipsf_interpolators_by_type.
+    instance, using the composite_shape_library definition and the already
+    constructed iPSF interpolators.
 
-    This structural rule ensures we never request an iPSF for a type that
-    was not precomputed in main.run_simulation. In this step we purposely
-    restrict configurations so that composite shapes reuse existing spherical
-    PSF types; allowing sub-particle-only types would require extending the
-    PSF precomputation logic.
+    Structural behavior:
+        - All spherical optical types (diameter, refractive_index) used by
+          sub-particles *must* have been included in the set of optical types
+          collected in main.run_simulation and therefore must have entries in
+          ipsf_interpolators_by_type.
+        - main.run_simulation is responsible for scanning
+          PARAMS['composite_shape_library'] and adding any sub-particle
+          optical types to its type_keys_required set before computing PSF
+          stacks. This ensures that when we arrive here, the necessary
+          interpolators are already available and no additional PSF
+          computation is needed.
+
+    This separation makes the PSF precomputation logic and the composite
+    geometry logic consistent and prevents hidden coupling between composite
+    definitions and base particle arrays.
+
+    Args:
+        params (dict): Global parameter dictionary.
+        particle_index (int): Index of the logical particle for which sub-
+            particles are being constructed.
+        base_diameter_nm (float): Optical diameter of the parent particle.
+        base_refractive_index (complex): Optical refractive index of the
+            parent particle.
+        ipsf_interpolators_by_type (dict): Mapping from type_key
+            (diameter_nm, n_real, n_imag) to IPSFZInterpolator, as computed
+            in main.run_simulation. Must contain entries for all optical
+            types referenced by the composite shapes.
+
+    Returns:
+        Tuple[SubParticle, ...]: Immutable sequence of SubParticle objects.
+
+    Raises:
+        ValueError/TypeError: For malformed composite_shape_library entries.
+        KeyError: If a sub-particle optical type was not included in the
+            precomputed interpolator set (indicating a bug or inconsistent
+            configuration), with a clear message.
     """
     library: Dict[str, Any] = params.get("composite_shape_library", {})
     if not isinstance(library, dict):
@@ -212,9 +243,9 @@ def _build_composite_subparticles_for_instance(
 
         diam_sub = sub_def.get("diameter_nm", None)
         if diam_sub is None:
-            diam_sub = float(base_diameter_nm)
+            diam_sub_val = float(base_diameter_nm)
         else:
-            diam_sub = float(diam_sub)
+            diam_sub_val = float(diam_sub)
 
         n_sub = sub_def.get("refractive_index", None)
         if n_sub is None:
@@ -222,15 +253,25 @@ def _build_composite_subparticles_for_instance(
         else:
             n_sub_complex = complex(n_sub)
 
-        type_key_sub = (float(diam_sub), float(n_sub_complex.real), float(n_sub_complex.imag))
+        type_key_sub = (
+            float(diam_sub_val),
+            float(n_sub_complex.real),
+            float(n_sub_complex.imag),
+        )
+
         if type_key_sub not in ipsf_interpolators_by_type:
+            # This indicates that the PSF precomputation step in main did not
+            # include this optical type in its type_keys_required set. That is
+            # either a configuration bug (e.g., composite shapes changed
+            # without re-running main) or a code bug. We raise a clear error
+            # message rather than silently falling back to an arbitrary type.
             raise KeyError(
                 "Composite sub-particle for particle index "
                 f"{particle_index} (shape '{shape_model}', sub index {sub_idx}) "
                 f"requires optical type_key={type_key_sub}, but no iPSF "
-                "interpolator was computed for this type. In the current "
-                "structural configuration, all composite sub-particles must "
-                "reuse optical types already present among the base particles."
+                "interpolator was precomputed for this type. The set of required "
+                "optical types must be collected from composite_shape_library "
+                "before PSF computation in main.run_simulation."
             )
 
         ipsf_interp = ipsf_interpolators_by_type[type_key_sub]
@@ -245,7 +286,7 @@ def _build_composite_subparticles_for_instance(
         sub_particles.append(
             SubParticle(
                 offset_nm=offset_nm_arr,
-                diameter_nm=diam_sub,
+                diameter_nm=diam_sub_val,
                 refractive_index=n_sub_complex,
                 ipsf_interpolator=ipsf_interp,
                 signal_multiplier=signal_multiplier_local,
@@ -283,10 +324,10 @@ def build_particle_types_and_instances(
             * Setting PARAMS["particle_shape_models"][i] = shape_name for
               the desired particles.
 
-          In the current structural step, all sub-particle optical types must
-          reuse existing per-type iPSF interpolators: any (diameter, n.real,
-          n.imag) combination used by a sub-particle must appear among the
-          base particle types. Violations raise a clear error.
+          The PSF precomputation step in main.run_simulation is responsible
+          for including any additional optical types used by sub-particles in
+          its iPSF stack computation. Here we simply enforce the existence of
+          those types and construct SubParticle objects.
 
     Orientation handling:
         - If `orientations` is None, all ParticleInstance objects are created
