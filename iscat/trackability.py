@@ -1,6 +1,9 @@
 import numpy as np
 
-from trajectory import stokes_einstein_diffusion_coefficient
+from trajectory import (
+    stokes_einstein_diffusion_coefficient,
+    _resolve_translational_diameters_nm,
+)
 
 
 class TrackabilityModel:
@@ -28,6 +31,14 @@ class TrackabilityModel:
     This is appropriate for synthetic data generation, where the goal is to
     gate mask generation according to human trackability rather than to
     re-estimate the particle position from scratch.
+
+    Structural note (translational equivalent diameters):
+        The diffusion scales used here are derived from the same translational
+        equivalent diameters as simulate_trajectories, via
+        _resolve_translational_diameters_nm(params). This ensures that any
+        future decoupling of optical diameter (for PSF) and hydrodynamic
+        diameter (for Brownian motion) is automatically reflected in both the
+        trajectories and the trackability model in a consistent way.
     """
 
     def __init__(self, params: dict, num_particles: int):
@@ -42,24 +53,28 @@ class TrackabilityModel:
         self.num_particles = int(num_particles)
         self.dt = 1.0 / float(params["fps"])
 
+        # Resolve translational equivalent diameters in nm so that the
+        # diffusion scales used here match those used in simulate_trajectories.
+        translational_diameters_nm = _resolve_translational_diameters_nm(params)
+
+        if translational_diameters_nm.shape[0] != self.num_particles:
+            raise ValueError(
+                "Length of translational diameters array must match "
+                f"num_particles ({self.num_particles}). Got "
+                f"{translational_diameters_nm.shape[0]}."
+            )
+
         # Precompute diffusion coefficients and characteristic radial
         # displacement scales for each particle.
         temp_K = float(params["temperature_K"])
         viscosity = float(params["viscosity_Pa_s"])
-        diameters_nm = params["particle_diameters_nm"]
-
-        if len(diameters_nm) != self.num_particles:
-            raise ValueError(
-                "Length of PARAMS['particle_diameters_nm'] must match "
-                "PARAMS['num_particles']."
-            )
 
         self.diffusion_coefficients_m2_s = np.zeros(self.num_particles, dtype=float)
         self.r_sigma_nm = np.zeros(self.num_particles, dtype=float)
 
         for i in range(self.num_particles):
             D_m2_s = stokes_einstein_diffusion_coefficient(
-                diameters_nm[i], temp_K, viscosity
+                translational_diameters_nm[i], temp_K, viscosity
             )
             self.diffusion_coefficients_m2_s[i] = D_m2_s
             # For 2D Brownian motion, <r^2> = 4 * D * dt. Use the square root

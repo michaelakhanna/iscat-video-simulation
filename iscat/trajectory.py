@@ -10,7 +10,10 @@ def stokes_einstein_diffusion_coefficient(diameter_nm, temp_K, viscosity_Pa_s):
     using the Stokes-Einstein equation.
 
     Args:
-        diameter_nm (float): Diameter of the particle in nanometers.
+        diameter_nm (float): Diameter of the particle in nanometers. In the
+            current architecture this value is interpreted as a translational
+            equivalent diameter when used for Brownian motion (see
+            _resolve_translational_diameters_nm).
         temp_K (float): Absolute temperature of the fluid in Kelvin.
         viscosity_Pa_s (float): Dynamic viscosity of the fluid in Pascal-seconds.
 
@@ -19,6 +22,86 @@ def stokes_einstein_diffusion_coefficient(diameter_nm, temp_K, viscosity_Pa_s):
     """
     radius_m = diameter_nm * 1e-9 / 2.0
     return (BOLTZMANN_CONSTANT * temp_K) / (6.0 * np.pi * viscosity_Pa_s * radius_m)
+
+
+def _resolve_translational_diameters_nm(params) -> np.ndarray:
+    """
+    Resolve the per-particle translational equivalent diameters (in nm) used
+    for Brownian motion and any diffusion-based models such as trackability.
+
+    Semantics (structural separation):
+        - Optical diameters used for PSF computation and type grouping remain
+          encoded in PARAMS["particle_diameters_nm"] and are consumed by the
+          optics / particle_type layer (main.run_simulation, particle_model).
+
+        - Translational diameters used in the Stokes–Einstein equation for
+          Brownian motion are conceptually allowed to differ and are resolved
+          here as a separate per-particle array.
+
+    Resolution logic:
+        - If PARAMS["particle_translational_diameters_nm"] exists:
+            * It must be array-like of length num_particles.
+            * All entries must be positive.
+            * These values are used for translational diffusion.
+        - Else:
+            * Fallback to PARAMS["particle_diameters_nm"], preserving the
+              existing behavior where a single diameter notion drives both
+              optics and diffusion.
+
+    This helper is the single source of truth for translational diameters and
+    is used by both simulate_trajectories and the TrackabilityModel so that
+    all diffusion-based components remain consistent.
+
+    Args:
+        params (dict): Global simulation parameter dictionary (PARAMS). Must
+            contain:
+                - "num_particles"
+                - "particle_diameters_nm"
+            and may optionally contain:
+                - "particle_translational_diameters_nm"
+
+    Returns:
+        np.ndarray: 1D float64 array of shape (num_particles,) containing the
+        translational equivalent diameters in nanometers.
+
+    Raises:
+        ValueError: If provided arrays have inconsistent lengths or contain
+            non-positive values.
+    """
+    num_particles = int(params["num_particles"])
+
+    base_diameters = params.get("particle_diameters_nm", None)
+    if base_diameters is None:
+        raise ValueError(
+            "PARAMS['particle_diameters_nm'] must be defined to resolve "
+            "translational diameters."
+        )
+    if len(base_diameters) != num_particles:
+        raise ValueError(
+            "Length of PARAMS['particle_diameters_nm'] "
+            f"({len(base_diameters)}) must match PARAMS['num_particles'] ({num_particles})."
+        )
+
+    translational_override = params.get("particle_translational_diameters_nm", None)
+    if translational_override is None:
+        # Default: translational diameter equals optical diameter.
+        diameters_nm = np.asarray(base_diameters, dtype=float)
+    else:
+        diameters_nm = np.asarray(translational_override, dtype=float)
+        if diameters_nm.shape != (num_particles,):
+            raise ValueError(
+                "PARAMS['particle_translational_diameters_nm'] must be an array-like "
+                f"of length num_particles ({num_particles}). Got shape {diameters_nm.shape}."
+            )
+
+    if not np.all(diameters_nm > 0.0):
+        raise ValueError(
+            "All translational diameters must be positive. Check "
+            "PARAMS['particle_translational_diameters_nm'] (or "
+            "PARAMS['particle_diameters_nm'] when no override is provided)."
+        )
+
+    return diameters_nm.astype(float)
 
 
 def simulate_trajectories(params):
@@ -104,6 +187,17 @@ def simulate_trajectories(params):
             [-z_stack_range_nm / 2, 0] when explicit positions are not
             provided, and user-specified initial positions must satisfy
             z <= 0 nm.
+
+    Translational equivalent diameter (structural change)
+    -----------------------------------------------------
+    The translational diffusion coefficient for each particle is computed from
+    a translational equivalent diameter:
+
+        - Resolved via _resolve_translational_diameters_nm(params).
+        - Defaults to PARAMS["particle_diameters_nm"] when no override is
+          provided, preserving existing behavior.
+        - Can be overridden per particle via PARAMS["particle_translational_diameters_nm"]
+          without affecting optical PSF types or particle shapes.
 
     Args:
         params (dict): Simulation parameter dictionary (PARAMS).
@@ -270,20 +364,15 @@ def simulate_trajectories(params):
     trajectories = np.zeros((num_particles, num_frames, 3), dtype=float)
     trajectories[:, 0, :] = initial_positions
 
-    # --- Precompute per-particle diffusion statistics ---
-    diameters_nm = params["particle_diameters_nm"]
-    if len(diameters_nm) != num_particles:
-        raise ValueError(
-            "Length of PARAMS['particle_diameters_nm'] "
-            f"({len(diameters_nm)}) must match PARAMS['num_particles'] ({num_particles})."
-        )
+    # --- Resolve translational equivalent diameters for diffusion ---
+    translational_diameters_nm = _resolve_translational_diameters_nm(params)
 
     temp_K = float(params["temperature_K"])
     viscosity_Pa_s = float(params["viscosity_Pa_s"])
 
     # Loop over particles and generate their trajectories one time step at a time.
     for i in range(num_particles):
-        diameter_nm = float(diameters_nm[i])
+        diameter_nm = float(translational_diameters_nm[i])
 
         # Diffusion coefficient for this particle (m^2/s).
         D_m2_s = stokes_einstein_diffusion_coefficient(
