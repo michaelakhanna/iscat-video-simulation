@@ -2,7 +2,7 @@ import numpy as np
 
 from trajectory import (
     stokes_einstein_diffusion_coefficient,
-    _resolve_translational_diameters_nm,
+    resolve_translational_diameters_nm,
 )
 
 
@@ -35,10 +35,12 @@ class TrackabilityModel:
     Structural note (translational equivalent diameters):
         The diffusion scales used here are derived from the same translational
         equivalent diameters as simulate_trajectories, via
-        _resolve_translational_diameters_nm(params). This ensures that any
+        resolve_translational_diameters_nm(params). This ensures that any
         future decoupling of optical diameter (for PSF) and hydrodynamic
         diameter (for Brownian motion) is automatically reflected in both the
-        trajectories and the trackability model in a consistent way.
+        trajectories and the trackability model in a consistent way, with
+        resolve_translational_diameters_nm acting as the single source of
+        truth for all diffusion-based components.
     """
 
     def __init__(self, params: dict, num_particles: int):
@@ -55,7 +57,7 @@ class TrackabilityModel:
 
         # Resolve translational equivalent diameters in nm so that the
         # diffusion scales used here match those used in simulate_trajectories.
-        translational_diameters_nm = _resolve_translational_diameters_nm(params)
+        translational_diameters_nm = resolve_translational_diameters_nm(params)
 
         if translational_diameters_nm.shape[0] != self.num_particles:
             raise ValueError(

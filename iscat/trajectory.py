@@ -7,13 +7,16 @@ from chip_pattern import is_position_in_chip_solid, project_position_to_fluid_re
 def stokes_einstein_diffusion_coefficient(diameter_nm, temp_K, viscosity_Pa_s):
     """
     Calculate the diffusion coefficient for a spherical particle in a fluid
-    using the Stokes-Einstein equation.
+    using the Stokes–Einstein equation.
 
     Args:
-        diameter_nm (float): Diameter of the particle in nanometers. In the
-            current architecture this value is interpreted as a translational
-            equivalent diameter when used for Brownian motion (see
-            _resolve_translational_diameters_nm).
+        diameter_nm (float):
+            Diameter of the particle in nanometers. In the current architecture
+            this value is interpreted as a **translational equivalent diameter**
+            when used for Brownian motion (i.e., the hydrodynamic diameter).
+            Code that calls this function for translational diffusion must
+            obtain diameters via resolve_translational_diameters_nm(params),
+            not directly from PARAMS['particle_diameters_nm'].
         temp_K (float): Absolute temperature of the fluid in Kelvin.
         viscosity_Pa_s (float): Dynamic viscosity of the fluid in Pascal-seconds.
 
@@ -24,33 +27,43 @@ def stokes_einstein_diffusion_coefficient(diameter_nm, temp_K, viscosity_Pa_s):
     return (BOLTZMANN_CONSTANT * temp_K) / (6.0 * np.pi * viscosity_Pa_s * radius_m)
 
 
-def _resolve_translational_diameters_nm(params) -> np.ndarray:
+def resolve_translational_diameters_nm(params) -> np.ndarray:
     """
     Resolve the per-particle translational equivalent diameters (in nm) used
     for Brownian motion and any diffusion-based models such as trackability.
 
-    Semantics (structural separation):
-        - Optical diameters used for PSF computation and type grouping remain
-          encoded in PARAMS["particle_diameters_nm"] and are consumed by the
-          optics / particle_type layer (main.run_simulation, particle_model).
+    Structural separation of optical vs translational size
+    ------------------------------------------------------
+    - Optical diameters:
+        * Stored in PARAMS["particle_diameters_nm"].
+        * Used exclusively by the optical/PSF systems (e.g., PSF computation,
+          particle type grouping, scattering strength).
+        * Define how large and bright the particle appears in the image.
 
-        - Translational diameters used in the Stokes–Einstein equation for
-          Brownian motion are conceptually allowed to differ and are resolved
-          here as a separate per-particle array.
+    - Translational diameters (hydrodynamic radii):
+        * Conceptually allowed to differ from optical diameters.
+        * Used in the Stokes–Einstein equation for translational Brownian
+          motion and all diffusion-based models (e.g., TrackabilityModel).
+        * Resolved once here and then shared by all diffusion users to keep
+          behavior consistent across the pipeline.
 
-    Resolution logic:
-        - If PARAMS["particle_translational_diameters_nm"] exists:
-            * It must be array-like of length num_particles.
-            * All entries must be positive.
-            * These values are used for translational diffusion.
-        - Else:
-            * Fallback to PARAMS["particle_diameters_nm"], preserving the
-              existing behavior where a single diameter notion drives both
-              optics and diffusion.
+    Resolution logic
+    ----------------
+    This helper is the **single source of truth** for translational diameters:
 
-    This helper is the single source of truth for translational diameters and
-    is used by both simulate_trajectories and the TrackabilityModel so that
-    all diffusion-based components remain consistent.
+    - If PARAMS["particle_translational_diameters_nm"] exists and is not None:
+        * It must be array-like of length num_particles.
+        * All entries must be positive.
+        * These values are used for translational diffusion.
+
+    - Else:
+        * Fallback to PARAMS["particle_diameters_nm"], preserving the original
+          behavior where a single diameter notion drives both optics and
+          diffusion (optical and hydrodynamic sizes are identical).
+
+    All components that depend on Brownian diffusion (e.g., simulate_trajectories,
+    TrackabilityModel) must call this function and must **not** read
+    particle_diameters_nm directly when computing diffusion coefficients.
 
     Args:
         params (dict): Global simulation parameter dictionary (PARAMS). Must
@@ -188,16 +201,20 @@ def simulate_trajectories(params):
             provided, and user-specified initial positions must satisfy
             z <= 0 nm.
 
-    Translational equivalent diameter (structural change)
-    -----------------------------------------------------
+    Translational equivalent diameter (separation from optical size)
+    ----------------------------------------------------------------
     The translational diffusion coefficient for each particle is computed from
     a translational equivalent diameter:
 
-        - Resolved via _resolve_translational_diameters_nm(params).
+        - Resolved via resolve_translational_diameters_nm(params).
         - Defaults to PARAMS["particle_diameters_nm"] when no override is
           provided, preserving existing behavior.
-        - Can be overridden per particle via PARAMS["particle_translational_diameters_nm"]
-          without affecting optical PSF types or particle shapes.
+        - Can be overridden per particle via
+          PARAMS["particle_translational_diameters_nm"] without affecting
+          optical PSF types or particle shapes.
+
+    This ensures that any future non-spherical/composite particles can have
+    different optical and hydrodynamic sizes without refactoring this code.
 
     Args:
         params (dict): Simulation parameter dictionary (PARAMS).
@@ -365,7 +382,7 @@ def simulate_trajectories(params):
     trajectories[:, 0, :] = initial_positions
 
     # --- Resolve translational equivalent diameters for diffusion ---
-    translational_diameters_nm = _resolve_translational_diameters_nm(params)
+    translational_diameters_nm = resolve_translational_diameters_nm(params)
 
     temp_K = float(params["temperature_K"])
     viscosity_Pa_s = float(params["viscosity_Pa_s"])

@@ -116,16 +116,43 @@ PARAMS = {
     # Positive integer. Many other particle-related arrays must have this length.
     "num_particles": 2,
 
-    # Diameter of each particle in nanometers.
-    # List or sequence of length num_particles. Each entry must be a positive
-    # float or int specifying the diameter of that particle.
+    # Diameter of each particle in nanometers (OPTICAL diameter).
     #
-    # For non-spherical / composite particles (future use), this diameter is
-    # interpreted as the translational *equivalent diameter* used in the
-    # Stokes–Einstein equation (CDD Section 3.2.2). Individual sub-particles
-    # within a composite shape may use the same or different diameters for
-    # their optical PSFs; those are defined in composite_shape_library.
+    # Semantics:
+    #   - This field always defines the **optical diameter** used for:
+    #       * PSF / iPSF computation and type grouping.
+    #       * Optical appearance (size/brightness through scattering).
+    #   - It may coincide with, but is conceptually separate from, the
+    #     hydrodynamic diameter used for Brownian motion.
+    #
+    # Translational Brownian motion does **not** read this field directly; it
+    # uses translational diameters resolved via resolve_translational_diameters_nm.
     "particle_diameters_nm": [100, 200],
+
+    # Optional translational equivalent diameters in nanometers (HYDRODYNAMIC).
+    #
+    # Semantics:
+    #   - When provided, this array defines the diameter used in the
+    #     Stokes–Einstein equation for translational Brownian motion and in
+    #     all diffusion-based models (e.g., TrackabilityModel).
+    #   - It is **never** used for optical PSF sizing or scattering strength;
+    #     optical appearance remains governed by particle_diameters_nm and
+    #     refractive indices.
+    #   - When omitted or set to None, translational diameters default to
+    #     particle_diameters_nm, preserving the original coupled behavior.
+    #
+    # Requirements:
+    #   - Must be array-like of length num_particles.
+    #   - All entries must be positive.
+    #
+    # Example usage (uncomment and adjust as needed):
+    # "particle_translational_diameters_nm": [80.0, 150.0],
+    #
+    # With the above example, particle 0 would diffuse as if it had an
+    # 80 nm hydrodynamic diameter but still scatter optically as a 100 nm
+    # sphere; particle 1 would diffuse as a 150 nm object but scatter as a
+    # 200 nm sphere.
+    # "particle_translational_diameters_nm": [...],
 
     # Complex refractive index (n + i k) of each particle.
     # List/sequence of length num_particles. Each entry can be:
