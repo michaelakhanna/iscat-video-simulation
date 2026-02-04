@@ -511,6 +511,83 @@ def _random_small_rotation_matrix(rng: np.random.Generator, std_angle_rad: float
     return R
 
 
+def resolve_rotational_step_std_rad(params: dict, num_particles: int) -> np.ndarray:
+    """
+    Resolve the per-particle rotational step standard deviation in radians.
+
+    Structural purpose
+    ------------------
+    This helper is the rotational analogue of resolve_translational_diameters_nm:
+    it centralizes how the user-facing rotational configuration in PARAMS is
+    turned into the actual per-particle per-frame angular step scale used by
+    simulate_orientations.
+
+    Current semantics (behavior-preserving)
+    ---------------------------------------
+    - The existing code uses a single scalar:
+          step_std_deg = PARAMS.get("rotational_step_std_deg", 5.0)
+          step_std_rad = deg2rad(step_std_deg)
+      applied uniformly to all particles.
+
+    - To preserve behavior exactly for existing configurations, this resolver:
+        * Reads the same scalar rotational_step_std_deg (default 5.0 degrees),
+        * Converts it to radians,
+        * Returns a 1D array of length num_particles with the same value for
+          every particle.
+
+    - If rotational diffusion is disabled via PARAMS["rotational_diffusion_enabled"],
+      simulate_orientations exits early before using this array. We still
+      return a valid array (zeros) for simplicity and future extensibility.
+
+    Future extensions
+    -----------------
+    This function is the single place where more complex behavior can be added
+    later (e.g., size- or shape-dependent angular steps, per-particle arrays,
+    or a physically derived rotational diffusion coefficient). simulate_orientations
+    only depends on this resolver and does not read rotational_step_std_deg
+    directly, making such changes localized and structurally safe.
+
+    Args:
+        params (dict): Global simulation parameter dictionary (PARAMS). May
+            contain:
+                - "rotational_diffusion_enabled"
+                - "rotational_step_std_deg"
+        num_particles (int): Number of particles for which step scales are
+            required. Must be positive when rotational diffusion is enabled.
+
+    Returns:
+        np.ndarray: 1D float64 array of shape (num_particles,) with the per-
+        particle standard deviation of the per-frame rotation angle in radians.
+    """
+    rotational_enabled = bool(params.get("rotational_diffusion_enabled", False))
+
+    num_particles = int(num_particles)
+    if num_particles <= 0:
+        raise ValueError(
+            "resolve_rotational_step_std_rad requires num_particles > 0, "
+            f"got num_particles={num_particles}."
+        )
+
+    # Default scalar step standard deviation in degrees, as in the previous
+    # implementation of simulate_orientations.
+    step_std_deg = float(params.get("rotational_step_std_deg", 5.0))
+    if step_std_deg < 0.0:
+        raise ValueError(
+            "PARAMS['rotational_step_std_deg'] must be non-negative if provided."
+        )
+
+    # Convert to radians. For now, apply the same value to all particles.
+    step_std_rad_scalar = float(np.deg2rad(step_std_deg))
+
+    if not rotational_enabled:
+        # Rotational diffusion is disabled; orientations are not simulated.
+        # Return an array of zeros for completeness, even though the caller
+        # will exit early and not use it.
+        return np.zeros(num_particles, dtype=float)
+
+    return np.full(num_particles, step_std_rad_scalar, dtype=float)
+
+
 def simulate_orientations(params: dict, num_particles: int, num_frames: int) -> np.ndarray | None:
     """
     Simulate rotational Brownian motion (orientation trajectories) for a set
@@ -599,13 +676,10 @@ def simulate_orientations(params: dict, num_particles: int, num_frames: int) -> 
         raise ValueError("PARAMS['fps'] must be positive when simulating orientations.")
     _dt = 1.0 / fps  # noqa: F841  # reserved for future physics-based refinement
 
-    # Standard deviation of per-frame rotation angle in radians.
-    step_std_deg = float(params.get("rotational_step_std_deg", 5.0))
-    if step_std_deg < 0.0:
-        raise ValueError(
-            "PARAMS['rotational_step_std_deg'] must be non-negative if provided."
-        )
-    step_std_rad = np.deg2rad(step_std_deg)
+    # Resolve per-particle step standard deviations in radians. For the current
+    # configuration this yields the same scalar value for every particle and
+    # preserves the previous behavior exactly.
+    step_std_rad_per_particle = resolve_rotational_step_std_rad(params, num_particles)
 
     # Derive a deterministic set of per-particle seeds from the global
     # np.random RNG. The dataset generator seeds np.random once per video,
@@ -625,12 +699,14 @@ def simulate_orientations(params: dict, num_particles: int, num_frames: int) -> 
     orientations = np.zeros((num_particles, num_frames, 3, 3), dtype=float)
     orientations[:, 0, :, :] = np.eye(3, dtype=float)
 
-    # Perform a random walk on SO(3) for each particle using its own Generator.
+    # Perform a random walk on SO(3) for each particle using its own Generator
+    # and its resolved per-particle angular step scale.
     for i in range(num_particles):
         rng_i = np.random.default_rng(int(particle_seeds_int[i]))
+        std_rad_i = float(step_std_rad_per_particle[i])
         for t in range(1, num_frames):
             R_prev = orientations[i, t - 1]
-            R_step = _random_small_rotation_matrix(rng_i, step_std_rad)
+            R_step = _random_small_rotation_matrix(rng_i, std_rad_i)
             # Post-multiply so that R_t maps body frame to lab frame after
             # applying the incremental rotation.
             orientations[i, t] = R_step @ R_prev
