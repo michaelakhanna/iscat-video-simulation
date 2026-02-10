@@ -1,4 +1,3 @@
-# File: postprocessing.py
 import numpy as np
 import cv2
 from tqdm import tqdm
@@ -136,6 +135,138 @@ def compute_contrast_frames(signal_frames, reference_frames, params):
             contrast_frames[idx] = frame - median_val
 
     return contrast_frames
+
+
+def compute_single_frame_contrast(signal_frame, reference_frame, params):
+    """
+    Compute a single-frame contrast image from raw signal and reference
+    frames, using the same background_subtraction_method semantics as
+    compute_contrast_frames for the 'reference_frame' case, but without any
+    temporal statistics or global percentile normalization.
+
+    This helper is intended for interactive/viewer-style tools that operate on
+    a single frame at a time. It focuses on producing a physically meaningful
+    contrast map for that frame only.
+
+    Behavior:
+        - Inputs are converted to float32 for computation.
+        - For background_subtraction_method == 'reference_frame':
+              contrast = (signal - reference) / (reference + eps)
+          where eps is a small constant to avoid division by zero.
+        - For 'video_median' or 'video_mean', a single frame does not provide
+          a temporal stack to form a median; these methods are not supported
+          here and will raise a ValueError with a clear message.
+        - For any other method string, a ValueError is raised.
+
+        - No per-frame median subtraction or percentile windowing is applied
+          here; the caller may choose how to visualize or further normalize
+          the resulting contrast field.
+
+    Args:
+        signal_frame (np.ndarray): 2D array, raw signal frame (uint16/float).
+        reference_frame (np.ndarray): 2D array, raw reference frame
+            (uint16/float).
+        params (dict): PARAMS-like dictionary providing
+            'background_subtraction_method'.
+
+    Returns:
+        np.ndarray: 2D float32 contrast image.
+    """
+    if signal_frame is None or reference_frame is None:
+        raise ValueError(
+            "signal_frame and reference_frame must be provided for single-frame contrast."
+        )
+
+    signal_f = np.asarray(signal_frame, dtype=np.float32)
+    reference_f = np.asarray(reference_frame, dtype=np.float32)
+
+    method = params.get("background_subtraction_method", "reference_frame")
+
+    if method == "reference_frame":
+        contrast = (signal_f - reference_f) / (reference_f + 1e-9)
+        return contrast.astype(np.float32)
+
+    if method in ("video_median", "video_mean"):
+        raise ValueError(
+            "compute_single_frame_contrast does not support 'video_median' or "
+            "'video_mean' for single-frame operation. Use 'reference_frame' "
+            "for viewer-style tools."
+        )
+
+    raise ValueError(
+        f"Unknown background_subtraction_method for single-frame contrast: {method}."
+    )
+
+
+def compute_single_frame_views(signal_frame, reference_frame, params):
+    """
+    Compute raw and contrast views for a single frame without global
+    normalization or video encoding.
+
+    Inputs:
+        signal_frame   : 2D array-like, raw signal frame (uint16 or float).
+        reference_frame: 2D array-like, raw reference frame (uint16 or float).
+        params         : PARAMS-like dict, used only for
+                         'background_subtraction_method'.
+
+    Behavior:
+        - raw_signal and raw_reference are float64 views of the inputs.
+        - contrast is computed according to background_subtraction_method, but
+          restricted to this single pair of frames and without temporal
+          statistics:
+
+            * "reference_frame":
+                contrast = (signal - reference) / (reference + eps)
+
+            * "video_median" (or "video_mean"):
+                For a single-frame viewer, there is no temporal stack to form a
+                median; we return a simple zero-mean version of the signal:
+
+                    contrast = signal - median(signal)
+
+          This keeps the function usable for any configured method while
+          avoiding misleading semantics for single-frame "video_median".
+
+        - A per-frame spatial median is subtracted from contrast, mirroring
+          compute_contrast_frames, to remove residual DC offset.
+
+    Returns:
+        dict with keys:
+            "raw_signal"    : 2D float64 array
+            "raw_reference" : 2D float64 array
+            "contrast"      : 2D float64 array
+    """
+    if signal_frame is None or reference_frame is None:
+        raise ValueError("signal_frame and reference_frame must be provided for single-frame views.")
+
+    signal_f = np.asarray(signal_frame, dtype=float)
+    reference_f = np.asarray(reference_frame, dtype=float)
+
+    method = params.get("background_subtraction_method", "reference_frame")
+
+    if method == "reference_frame":
+        contrast = (signal_f - reference_f) / (reference_f + 1e-9)
+    elif method in ("video_median", "video_mean"):
+        # Degenerate single-frame version of video_median: remove spatial
+        # median so that the contrast is zero-centered but still reflects the
+        # raw signal structure.
+        median_val = np.median(signal_f)
+        contrast = signal_f - median_val
+    else:
+        raise ValueError(
+            f"Unknown background_subtraction_method for single-frame views: {method}."
+        )
+
+    # Per-frame baseline removal (robust against particle signal).
+    frame_median = np.median(contrast)
+    if frame_median != 0.0:
+        contrast = contrast - frame_median
+
+    return {
+        "raw_signal": signal_f,
+        "raw_reference": reference_f,
+        "contrast": contrast,
+    }
 
 
 def compute_normalization_range(contrast_frames):

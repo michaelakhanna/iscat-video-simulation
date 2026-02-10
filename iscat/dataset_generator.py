@@ -1,3 +1,4 @@
+# File: dataset_generator.py
 """
 High-level dataset generation wrapper for the iSCAT simulation.
 
@@ -47,7 +48,9 @@ from main import run_simulation
 from presets import (
     apply_instrument_preset,
     create_params_for_experiment,
+    create_sam2_training_base_params,
 )
+from materials import lookup_refractive_index
 from metadata import (
     build_video_manifest,
     save_video_manifest,
@@ -83,6 +86,231 @@ def _resolve_base_output_dir(base_output_dir: Optional[str]) -> str:
     return base_output_dir
 
 
+def _build_sam2_training_params_for_video(
+    video_index: int,
+    rng: np.random.Generator,
+) -> Dict[str, Any]:
+    """
+    Construct a fully specified PARAMS dict for a single SAM2-training video.
+
+    This builder implements the dataset-level orchestration described in the
+    implementation plan:
+
+        - Uses a fixed optical / acquisition configuration suitable for SAM2
+          training (image size, NA, wavelength, duration, etc.).
+        - Samples per-video parameters from well-defined distributions:
+            * fps: 90% 30 Hz, 10% 24 Hz; exposure_time_ms = 1000 / fps.
+            * duration_seconds: fixed 3.0 s (72 or 90 frames).
+            * num_particles: 30% -> 1, 60% -> 2, 10% -> 3.
+            * particle_diameters_nm: per-video mean mu ~ U(150, 300) nm,
+              per-particle Gaussian N(mu, 30^2), hard-clamped to [150, 300].
+            * particle_shape_models: all "spherical".
+            * particle_refractive_indices: per-particle complex n interpolated
+              between PET and Gold at 635 nm with small jitter.
+            * particle_materials: None (indices are explicit).
+            * particle_signal_multipliers: all 1.0.
+            * chip_pattern_enabled: 70% True, 30% False; when True, use
+              gold_holes_v1 with randomized hole_diameter_um and
+              hole_edge_to_edge_spacing_um in the specified ranges.
+            * background_subtraction_method: 60% "video_median",
+              40% "reference_frame".
+            * read_noise_std, background_intensity, and
+              chip_pattern_contrast_amplitude sampled from the specified
+              uniform ranges.
+        - Leaves the core physics and rendering pipeline unchanged.
+
+    The returned dict is ready to be passed directly to run_simulation.
+    """
+    # Start from a dedicated SAM2 base preset so that truly constant aspects
+    # (optics, duration, NA, etc.) are centralized and kept consistent.
+    params = create_sam2_training_base_params()
+
+    # --- Global constants for this dataset (per video) -----------------------
+    # Ensure we are in the desired optical configuration.
+    params["image_size_pixels"] = 1024
+    # Keep pixel_size_nm from the base preset (derived from 60x Nikon config).
+    params["wavelength_nm"] = 635.0
+    params["numerical_aperture"] = 1.2
+    params["magnification"] = 60
+    params["refractive_index_medium"] = 1.33
+    # Override immersion index to the dataset-specific value.
+    params["refractive_index_immersion"] = 1.515
+    params["duration_seconds"] = 3.0
+    params["bit_depth"] = 16
+
+    params["mask_generation_enabled"] = True
+    params["trackability_enabled"] = True
+    params["trackability_confidence_threshold"] = 0.2
+
+    # Constrain z-motion with a reflective boundary near the surface.
+    params["z_motion_constraint_model"] = "reflective_boundary_v1"
+
+    # Keep existing z-stack step; it is already 50 nm in config.
+    params["z_stack_step_nm"] = 50.0
+
+    # Motion blur: enabled with 4 subsamples.
+    params["motion_blur_enabled"] = True
+    params["motion_blur_subsamples"] = 4
+
+    # Rotational diffusion is irrelevant for strictly spherical particles but
+    # we keep the default setting; the PSF for a sphere is rotationally
+    # symmetric.
+    # ---------------------------------------------------------------------
+    # FPS and exposure-time distribution
+    u_fps = float(rng.random())
+    if u_fps < 0.9:
+        fps = 30.0
+    else:
+        fps = 24.0
+    params["fps"] = fps
+    params["exposure_time_ms"] = 1000.0 / fps
+
+    # ---------------------------------------------------------------------
+    # Background subtraction method
+    v_bg = float(rng.random())
+    if v_bg < 0.6:
+        params["background_subtraction_method"] = "video_median"
+    else:
+        params["background_subtraction_method"] = "reference_frame"
+
+    # ---------------------------------------------------------------------
+    # Number of particles per video
+    w_np = float(rng.random())
+    if w_np < 0.30:
+        num_particles = 1
+    elif w_np < 0.90:
+        num_particles = 2
+    else:
+        num_particles = 3
+    params["num_particles"] = num_particles
+
+    # ---------------------------------------------------------------------
+    # Particle shape models: spherical only for this dataset.
+    params["particle_shape_models"] = ["spherical"] * num_particles
+
+    # ---------------------------------------------------------------------
+    # Particle diameters: per-video Gaussian around a uniform mean.
+    mu_d = float(rng.uniform(150.0, 300.0))
+    sigma_d = 30.0
+
+    diameters: List[float] = []
+    for _ in range(num_particles):
+        d_raw = float(rng.normal(mu_d, sigma_d))
+        if d_raw < 150.0:
+            d = 150.0
+        elif d_raw > 300.0:
+            d = 300.0
+        else:
+            d = d_raw
+        diameters.append(d)
+    params["particle_diameters_nm"] = diameters
+
+    # Keep translational diameters coupled to optical diameters for now by
+    # omitting particle_translational_diameters_nm.
+
+    # ---------------------------------------------------------------------
+    # Refractive indices / materials:
+    # Build a continuous distribution between PET and Gold at 635 nm.
+    wavelength_nm = float(params["wavelength_nm"])
+
+    n_pet = lookup_refractive_index("PET", wavelength_nm=wavelength_nm)
+    n_gold = lookup_refractive_index("Gold", wavelength_nm=wavelength_nm)
+
+    particle_indices: List[complex] = []
+    for _ in range(num_particles):
+        t = float(rng.uniform(0.0, 1.0))
+        n_interp = (1.0 - t) * n_pet + t * n_gold
+
+        # Small jitter in both real and imaginary parts to add variety.
+        delta_real = float(rng.normal(0.0, 0.05))
+        delta_imag = float(rng.normal(0.0, 0.2))
+
+        n_val = complex(n_interp.real + delta_real, n_interp.imag + delta_imag)
+
+        # Clamp to physically sensible ranges.
+        real_clamped = min(max(n_val.real, 1.3), 3.0)
+        imag_clamped = min(max(n_val.imag, 0.0), 4.0)
+
+        particle_indices.append(complex(real_clamped, imag_clamped))
+
+    params["particle_refractive_indices"] = particle_indices
+    # Explicit indices override any material labels; we set materials to None.
+    params["particle_materials"] = [None] * num_particles
+
+    # ---------------------------------------------------------------------
+    # Particle brightness: fixed nominal multiplier.
+    params["particle_signal_multipliers"] = [1.0] * num_particles
+
+    # ---------------------------------------------------------------------
+    # Chip pattern usage and geometry
+    c_chip = float(rng.random())
+    if c_chip < 0.7:
+        chip_enabled = True
+    else:
+        chip_enabled = False
+
+    params["chip_pattern_enabled"] = chip_enabled
+
+    if chip_enabled:
+        params["chip_pattern_model"] = "gold_holes_v1"
+        params["chip_substrate_preset"] = "default_gold_holes"
+        params["background_fluorescence_enabled"] = False
+
+        # Start from the baseline chip dimensions and override the fields
+        # that should vary per video.
+        base_chip_dims = deepcopy(PARAMS.get("chip_pattern_dimensions", {}))
+        hole_diameter_um = float(rng.uniform(15.0, 90.0))
+        hole_spacing_um = float(rng.uniform(2.0, 14.0))
+
+        base_chip_dims["hole_diameter_um"] = hole_diameter_um
+        base_chip_dims["hole_edge_to_edge_spacing_um"] = hole_spacing_um
+        # Keep the default 20 nm depth from the config for this dataset.
+        base_chip_dims["hole_depth_nm"] = 20.0
+
+        params["chip_pattern_dimensions"] = base_chip_dims
+    else:
+        params["chip_pattern_model"] = "none"
+        params["chip_substrate_preset"] = "empty_background"
+        params["background_fluorescence_enabled"] = False
+
+    # Keep chip pattern randomization controls as in the base config.
+    params["chip_pattern_randomization_enabled"] = PARAMS.get(
+        "chip_pattern_randomization_enabled", True
+    )
+    params["chip_pattern_position_jitter_std_nm"] = PARAMS.get(
+        "chip_pattern_position_jitter_std_nm", 50.0
+    )
+    params["chip_pattern_shape_regularity"] = PARAMS.get(
+        "chip_pattern_shape_regularity", 0.73
+    )
+    params["chip_pattern_edge_perturbation_max_rel_radius"] = PARAMS.get(
+        "chip_pattern_edge_perturbation_max_rel_radius", 0.12
+    )
+    params["chip_pattern_edge_perturbation_mode_count"] = PARAMS.get(
+        "chip_pattern_edge_perturbation_mode_count", 3
+    )
+
+    # ---------------------------------------------------------------------
+    # Noise and background parameters
+    read_noise_std = float(rng.uniform(3.0, 9.0))
+    background_intensity = float(rng.uniform(75.0, 125.0))
+    chip_contrast_amp = float(rng.uniform(0.4, 0.7))
+
+    params["read_noise_std"] = read_noise_std
+    params["background_intensity"] = background_intensity
+    params["chip_pattern_contrast_amplitude"] = chip_contrast_amp
+
+    # Keep existing noise toggles and shot noise scaling.
+    params["shot_noise_enabled"] = PARAMS.get("shot_noise_enabled", True)
+    params["shot_noise_scaling_factor"] = PARAMS.get("shot_noise_scaling_factor", 1.0)
+    params["gaussian_noise_enabled"] = PARAMS.get("gaussian_noise_enabled", True)
+
+    # Ensure mask path is set by the caller; we do not set output_filename
+    # or mask_output_directory here.
+
+    return params
+
+
 def _build_params_for_video(
     video_index: int,
     rng: np.random.Generator,
@@ -95,10 +323,11 @@ def _build_params_for_video(
 
     Priority:
         - If experiment_preset is provided:
-            Use create_params_for_experiment(experiment_preset, rng). This
-            function internally applies the appropriate instrument preset and
-            performs any experiment-specific randomization (e.g., exposure
-            time, particle materials).
+            * If experiment_preset == "sam2_training", use the dedicated
+              SAM2 training builder and ignore instrument_preset.
+            * Else, use create_params_for_experiment(experiment_preset, rng).
+              This function internally applies the appropriate instrument
+              preset and performs any experiment-specific randomization.
 
         - Else if only instrument_preset is provided:
             Apply that instrument preset on top of a deepcopy of config.PARAMS.
@@ -107,12 +336,11 @@ def _build_params_for_video(
             Use a deepcopy of config.PARAMS as-is.
 
     The rng argument is a per-video NumPy Generator. It is used only for
-    experiment presets (via create_params_for_experiment). Instrument presets
-    and the base config do not depend on rng.
+    experiment presets (via create_params_for_experiment and the SAM2 builder).
+    Instrument presets and the base config do not depend on rng.
 
     Args:
         video_index (int): Zero-based index of the video being generated.
-            Currently only used for debugging or future extensions.
         rng (np.random.Generator): Per-video random number generator used for
             experiment-level parameter sampling when experiment_preset is set.
         experiment_preset (Optional[str]): Name of the experiment preset, or
@@ -125,16 +353,17 @@ def _build_params_for_video(
         Dict[str, Any]: A fresh parameter dictionary for this video.
     """
     if experiment_preset is not None:
-        # Experiment presets are the highest-level configuration. They may
-        # internally apply an instrument preset and perform randomization.
-        params = create_params_for_experiment(experiment_preset, rng)
+        if experiment_preset.strip().lower() == "sam2_training":
+            params = _build_sam2_training_params_for_video(
+                video_index=video_index,
+                rng=rng,
+            )
+        else:
+            params = create_params_for_experiment(experiment_preset, rng)
     elif instrument_preset is not None:
-        # Apply an instrument preset on top of a clean copy of the global
-        # PARAMS template.
         base = deepcopy(PARAMS)
         params = apply_instrument_preset(base, instrument_preset)
     else:
-        # No presets requested: use a clean copy of the base parameters.
         params = deepcopy(PARAMS)
 
     return params
@@ -160,7 +389,9 @@ def generate_dataset(
         - If experiment_preset is provided, it is used to construct the full
           parameter dictionary for each video. Experiment presets may apply
           instrument presets internally and perform physics-based randomization
-          (e.g., the 'nanoplastic_surface' preset).
+          (e.g., the 'nanoplastic_surface' preset). The special value
+          'sam2_training' enables the SAM2 training dataset orchestration
+          described in the CDD.
         - If experiment_preset is None but instrument_preset is provided, that
           instrument preset is applied on top of a deepcopy of config.PARAMS.
         - If both are None, a deepcopy of config.PARAMS is used as-is.
@@ -212,8 +443,8 @@ def generate_dataset(
     Args:
         num_videos (int): Number of videos to generate. Must be >= 1.
         experiment_preset (Optional[str]): Name of the experiment preset to
-            use (e.g., "nanoplastic_surface"), or None. If provided, this
-            takes precedence over instrument_preset.
+            use (e.g., "nanoplastic_surface" or "sam2_training"), or None. If
+            provided, this takes precedence over instrument_preset.
         instrument_preset (Optional[str]): Name of the instrument preset to
             use (e.g., "60x_nikon"), or None. Ignored when experiment_preset
             is provided.
@@ -347,8 +578,9 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "Name of the experiment preset to use (e.g., 'nanoplastic_surface'). "
-            "If provided, this takes precedence over --instrument."
+            "Name of the experiment preset to use (e.g., 'nanoplastic_surface' "
+            "or 'sam2_training'). If provided, this takes precedence over "
+            "--instrument."
         ),
     )
     parser.add_argument(
@@ -394,12 +626,15 @@ def main() -> None:
         # Generate 10 videos using the 'nanoplastic_surface' experiment preset:
         python dataset_generator.py --num_videos 10 --experiment nanoplastic_surface
 
+        # Generate 30 videos using the 'sam2_training' SAM2 dataset preset:
+        python dataset_generator.py --num_videos 30 --experiment sam2_training
+
         # Generate 5 videos using the '60x_nikon' instrument preset, writing
         # outputs under a custom directory:
         python dataset_generator.py --num_videos 5 --instrument 60x_nikon --output_dir /path/to/dataset
 
         # Generate a reproducible dataset with a fixed random seed:
-        python dataset_generator.py --num_videos 10 --experiment nanoplastic_surface --seed 12345
+        python dataset_generator.py --num_videos 10 --experiment sam2_training --seed 12345
     """
     args = _parse_args()
     generate_dataset(

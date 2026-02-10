@@ -74,7 +74,7 @@ PARAMS = {
     # particle to continue receiving masks when trackability is enabled.
     # If the confidence for a particle falls below this threshold, that
     # particle is marked "lost" and no further masks are generated for it.
-    "trackability_confidence_threshold": 0.3,
+    "trackability_confidence_threshold": 0.2,
 
     # Master switch for the Human Trackability Confidence Model.
     #   True  -> the TrackabilityModel is used to decide whether to generate
@@ -92,7 +92,7 @@ PARAMS = {
 
     # Numerical aperture (NA) of the microscope objective.
     # Positive float; must satisfy 0 < NA <= refractive_index_immersion.
-    "numerical_aperture": 1.4,
+    "numerical_aperture": 1.2,
 
     # Magnification of the objective (for reference/documentation only).
     # Positive float or int (e.g., 60, 100). Not directly used in the physics
@@ -187,7 +187,7 @@ PARAMS = {
     #   0.0 -> particle effectively "off" (no scattered signal).
     #   1.0 -> nominal brightness.
     #  >1.0 -> brighter than nominal.
-    "particle_signal_multipliers": [1.0, 1.0],
+    "particle_signal_multipliers": [0.3, 0.3],
 
     # Optional explicit initial positions for each particle in nanometers.
     # If provided, must be an array-like of shape (num_particles, 3),
@@ -259,7 +259,7 @@ PARAMS = {
     "shot_noise_enabled": True,
     "shot_noise_scaling_factor": 1.00,
     "gaussian_noise_enabled": True,
-    "read_noise_std": 3,
+    "read_noise_std": 7,
     "background_subtraction_method": "video_median",
 
     # --- MOTION BLUR ---

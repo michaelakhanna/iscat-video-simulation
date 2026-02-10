@@ -11,7 +11,11 @@ from materials import resolve_particle_refractive_indices
 from trajectory import simulate_trajectories, stokes_einstein_diffusion_coefficient, simulate_orientations
 from optics import compute_ipsf_stack
 from rendering import generate_video_and_masks
-from postprocessing import apply_background_subtraction, save_video
+from postprocessing import (
+    apply_background_subtraction,
+    save_video,
+    compute_single_frame_contrast,
+)
 from particle_model import build_particle_types_and_instances  # new structured model
 
 # Suppress RankWarning from numpy's polyfit, which can occur in Mie scattering calculations
@@ -184,7 +188,7 @@ def _estimate_global_z_stack_range_nm(params: dict, diameters_nm) -> float:
     return float(auto_range_nm)
 
 
-def run_simulation(params: dict) -> None:
+def run_simulation(params: dict, return_frames: bool = False):
     """
     Run the complete iSCAT simulation and video generation pipeline for a given
     parameter dictionary.
@@ -218,6 +222,31 @@ def run_simulation(params: dict) -> None:
     per-particle state. This makes the particle representation explicit and
     prepares the codebase for future extensions (e.g., non-spherical shapes)
     without changing user-visible behavior.
+
+    Optional multi-view export hook:
+        If return_frames is False (default), behavior is unchanged: the
+        function performs the full simulation and writes the final video, and
+        returns None.
+
+        If return_frames is True, the function still performs the full
+        simulation and writes the video, but additionally returns a dict:
+
+            {
+                "raw_signal_frames": raw_signal_frames,
+                "raw_reference_frames": raw_reference_frames,
+                "final_frames_8bit": final_frames_8bit,
+            }
+
+        where:
+            - raw_signal_frames and raw_reference_frames are the uint16 (or
+              compatible dtype) raw frames produced by generate_video_and_masks.
+            - final_frames_8bit is the list of 8-bit frames output by
+              apply_background_subtraction. If no frames are produced, all
+              three lists are empty.
+
+        This hook is used by the single-frame viewer and future GUI tools to
+        obtain multiple internal views of the same simulated frame without
+        re-reading data from disk.
     """
     # --- Setup Output Directories ---
     if params["mask_generation_enabled"]:
@@ -557,11 +586,273 @@ def run_simulation(params: dict) -> None:
 
     if not final_frames:
         print("Video generation failed or produced no frames. Exiting.")
-        return
+        # When requested, still return an empty structure so callers that rely
+        # on the multi-view hook do not crash.
+        if return_frames:
+            return {
+                "raw_signal_frames": list(raw_signal_frames),
+                "raw_reference_frames": list(raw_reference_frames),
+                "final_frames_8bit": [],
+            }
+        return None
 
     # --- Step 5: Save the final video ---
     img_size = (params["image_size_pixels"], params["image_size_pixels"])
     save_video(params["output_filename"], final_frames, params["fps"], img_size)
+
+    if return_frames:
+        # Expose raw lists directly. Callers must treat the arrays as
+        # read-only; the simulation does not mutate them after this point.
+        return {
+            "raw_signal_frames": list(raw_signal_frames),
+            "raw_reference_frames": list(raw_reference_frames),
+            "final_frames_8bit": list(final_frames),
+        }
+
+    return None
+
+
+def generate_single_frame_views(params: dict) -> dict:
+    """
+    Generate all relevant single-frame views for the current parameter set.
+
+    Assumptions:
+      - params is a full PARAMS-like dictionary.
+      - The caller has already configured params for the desired scenario
+        (e.g., single frame, single particle) if needed.
+      - This function does NOT write any files (no mp4, no masks).
+
+    Returns:
+      A dict containing:
+        - "params_resolved": the params dict (modified in-place; includes
+          resolved particle_refractive_indices).
+        - "raw_signal_frame": 2D uint16 (or compatible) array of the signal frame.
+        - "raw_reference_frame": 2D uint16 (or compatible) array of the reference frame.
+        - "contrast_frame": 2D float32 array of the contrast frame.
+        - "final_frame_8bit": 2D uint8 array representing a fully postprocessed image.
+    """
+    # We intentionally modify params in-place (e.g., to fill particle
+    # refractive indices). Callers that care about preserving the original
+    # dictionary should pass in a copy.
+    params_local = params
+
+    # --- Resolve per-particle refractive indices ---
+    particle_refractive_indices = resolve_particle_refractive_indices(params_local)
+    diameters_nm = params_local["particle_diameters_nm"]
+
+    # --- Simulate motion and orientations ---
+    trajectories_nm = simulate_trajectories(params_local)
+
+    num_particles = int(params_local["num_particles"])
+    fps = float(params_local["fps"])
+    duration_seconds = float(params_local["duration_seconds"])
+    num_frames = int(fps * duration_seconds)
+    orientations = simulate_orientations(params_local, num_particles, num_frames)
+
+    # --- Collect optical types (same logic as run_simulation) ---
+    type_to_indices = {}
+    type_keys_required = set()
+
+    for i in range(num_particles):
+        n_complex = particle_refractive_indices[i]
+        key = (
+            float(diameters_nm[i]),
+            float(n_complex.real),
+            float(n_complex.imag),
+        )
+        type_to_indices.setdefault(key, []).append(i)
+        type_keys_required.add(key)
+
+    composite_library = params_local.get("composite_shape_library", {})
+    if composite_library is not None and isinstance(composite_library, dict):
+        raw_shape_models = params_local.get("particle_shape_models", None)
+        if raw_shape_models is None:
+            shape_models = ["spherical"] * num_particles
+        else:
+            if not isinstance(raw_shape_models, (list, tuple)):
+                raise TypeError(
+                    "PARAMS['particle_shape_models'] must be a list or tuple of "
+                    "length num_particles when provided."
+                )
+            if len(raw_shape_models) != num_particles:
+                raise ValueError(
+                    "Length of PARAMS['particle_shape_models'] "
+                    f"({len(raw_shape_models)}) must match PARAMS['num_particles'] "
+                    f"({num_particles})."
+                )
+            shape_models = [
+                "spherical" if entry is None else str(entry).strip()
+                for entry in raw_shape_models
+            ]
+
+        for p_idx in range(num_particles):
+            shape_name = shape_models[p_idx]
+            if shape_name.lower() == "spherical":
+                continue
+            if shape_name not in composite_library:
+                continue
+
+            shape_def = composite_library[shape_name]
+            sub_defs = shape_def.get("sub_particles", None)
+            if not isinstance(sub_defs, list) or len(sub_defs) == 0:
+                continue
+
+            base_diam_nm = float(diameters_nm[p_idx])
+            base_n = particle_refractive_indices[p_idx]
+            base_n_complex = complex(base_n)
+
+            for sub_def in sub_defs:
+                if not isinstance(sub_def, dict):
+                    continue
+
+                diam_sub = sub_def.get("diameter_nm", None)
+                if diam_sub is None:
+                    diam_sub_val = base_diam_nm
+                else:
+                    diam_sub_val = float(diam_sub)
+
+                n_sub = sub_def.get("refractive_index", None)
+                if n_sub is None:
+                    n_sub_complex = base_n_complex
+                else:
+                    n_sub_complex = complex(n_sub)
+
+                type_key_sub = (
+                    float(diam_sub_val),
+                    float(n_sub_complex.real),
+                    float(n_sub_complex.imag),
+                )
+                type_keys_required.add(type_key_sub)
+
+    # --- Build per-type z-grids and iPSF interpolators ---
+    z_step_nm = float(params_local["z_stack_step_nm"])
+    if z_step_nm <= 0.0:
+        raise ValueError("PARAMS['z_stack_step_nm'] must be positive.")
+
+    def _build_safe_z_grid_for_type_local(
+        z_min_realized_nm: float,
+        z_max_realized_nm: float,
+        z_step_nm_val: float,
+    ) -> np.ndarray:
+        z_min_realized_nm = float(z_min_realized_nm)
+        z_max_realized_nm = float(z_max_realized_nm)
+        z_step_nm_val = float(z_step_nm_val)
+
+        if z_step_nm_val <= 0.0:
+            raise ValueError("PARAMS['z_stack_step_nm'] must be positive.")
+
+        if z_max_realized_nm < z_min_realized_nm:
+            z_min_realized_nm, z_max_realized_nm = z_max_realized_nm, z_min_realized_nm
+
+        z_center = 0.5 * (z_min_realized_nm + z_max_realized_nm)
+        realized_half_span = 0.5 * (z_max_realized_nm - z_min_realized_nm)
+
+        absolute_margin_nm = 5.0 * z_step_nm_val
+        relative_margin_factor = 0.10
+        min_half_span_nm = 100.0 * z_step_nm_val
+
+        safe_half_span = realized_half_span
+        safe_half_span += absolute_margin_nm
+        safe_half_span *= (1.0 + relative_margin_factor)
+        safe_half_span = max(safe_half_span, min_half_span_nm)
+
+        max_half_span_allowed = 0.5 * _MAX_AUTO_Z_STACK_RANGE_NM
+        if safe_half_span > max_half_span_allowed:
+            safe_half_span = max_half_span_allowed
+
+        z_min_safe = z_center - safe_half_span
+        z_max_safe = z_center + safe_half_span
+
+        z_values = np.arange(z_min_safe, z_max_safe + z_step_nm_val, z_step_nm_val, dtype=float)
+        if z_values.size < 2:
+            z_values = np.array(
+                [z_center - z_step_nm_val * 0.5, z_center + z_step_nm_val * 0.5],
+                dtype=float,
+            )
+
+        return z_values
+
+    ipsf_interpolators_by_type = {}
+    default_z_range_nm = float(params_local.get("z_stack_range_nm", 30500.0))
+    default_half_span_nm = 0.5 * default_z_range_nm
+
+    for type_key in sorted(type_keys_required):
+        diam_nm_type, n_real, n_imag = type_key
+        indices = type_to_indices.get(type_key, None)
+
+        if indices is not None and len(indices) > 0:
+            indices_array = np.asarray(indices, dtype=int)
+            z_positions_type = trajectories_nm[indices_array, :, 2]
+            z_min_realized = float(np.min(z_positions_type))
+            z_max_realized = float(np.max(z_positions_type))
+
+            z_values_type = _build_safe_z_grid_for_type_local(
+                z_min_realized_nm=z_min_realized,
+                z_max_realized_nm=z_max_realized,
+                z_step_nm_val=z_step_nm,
+            )
+        else:
+            z_center = 0.0
+            z_min_safe = z_center - default_half_span_nm
+            z_max_safe = z_center + default_half_span_nm
+            z_values_type = np.arange(
+                z_min_safe, z_max_safe + z_step_nm, z_step_nm, dtype=float
+            )
+
+        n_complex_type = complex(n_real, n_imag)
+        ipsf_interpolators_by_type[type_key] = compute_ipsf_stack(
+            params_local,
+            diam_nm_type,
+            n_complex_type,
+            z_values_type,
+        )
+
+    # --- Build particle instances ---
+    _, particle_instances = build_particle_types_and_instances(
+        params=params_local,
+        trajectories_nm=trajectories_nm,
+        particle_refractive_indices=particle_refractive_indices,
+        ipsf_interpolators_by_type=ipsf_interpolators_by_type,
+        orientations=orientations,
+    )
+
+    # --- Render raw frames (signal/reference) ---
+    raw_signal_frames, raw_reference_frames = generate_video_and_masks(
+        params_local,
+        particle_instances,
+    )
+
+    raw_signal_frame = raw_signal_frames[0] if raw_signal_frames else None
+    raw_reference_frame = raw_reference_frames[0] if raw_reference_frames else None
+
+    # --- Contrast frame ---
+    if raw_signal_frame is not None and raw_reference_frame is not None:
+        contrast_frame = compute_single_frame_contrast(
+            raw_signal_frame,
+            raw_reference_frame,
+            params_local,
+        )
+    else:
+        contrast_frame = None
+
+    # --- Final 8-bit frame ---
+    if raw_signal_frame is not None and raw_reference_frame is not None:
+        final_8bit_list = apply_background_subtraction(
+            [raw_signal_frame],
+            [raw_reference_frame],
+            params_local,
+        )
+        final_frame_8bit = final_8bit_list[0] if final_8bit_list else None
+    else:
+        final_frame_8bit = None
+
+    return {
+        "params_resolved": params_local,
+        "raw_signal_frame": raw_signal_frame,
+        "raw_reference_frame": raw_reference_frame,
+        "contrast_frame": contrast_frame,
+        "final_frame_8bit": final_frame_8bit,
+    }
 
 
 def main():
