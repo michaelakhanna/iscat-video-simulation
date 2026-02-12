@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Khanna"
+    given-names: "Michael A."
+    orcid: "https://orcid.org/0009-0000-1458-0729"
+title: "SyniSCAT: A Pipeline for Synthetic Large-Scale Interferometric Scattering Video Generation"
+version: 1.0.0
+doi: 10.5281/zenodo.18617286
+date-released: 2026-02-11
+url: "https://github.com/michaelakhanna/iscat-video-simulation"
