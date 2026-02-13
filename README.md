@@ -1,5 +1,22 @@
 [![DOI](https://zenodo.org/badge/1130729031.svg)](https://doi.org/10.5281/zenodo.18617286)
 
+SyniSCAT is a Python-based simulation pipeline designed to generate synthetic datasets for Interferometric Scattering (iSCAT) microscopy. It provides a framework for creating large-scale training data for deep learning models (such as Transformers) by simulating the optical scattering of non-spherical particles and complex background noise.
+
+Key Features:
+
+Scattering Approximation: Implements a "rigid sphere cluster" model to approximate the scattering patterns of complex particle shapes using superposition.
+
+Defect Modeling: Explicitly simulates lithography artifacts, including nano-hole irregularities, edge roughness, and "double-dipping" effects.
+
+Data Pipeline: Automates the generation of full video sequences paired with ground-truth segmentation masks.
+
+
+
+Michael A Khanna; Ndukaife Lab at Vanderbilt
+
+Under Suprivision of Dr. Justus Ndukaife 
+
+
 Under Suprivision of Dr. Justus Ndukaife
 
 ```markdown
